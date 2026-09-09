@@ -271,6 +271,8 @@ async def test_retry_queue_overflow_is_dead_lettered(monkeypatch):
     evicted = await store.get_by_source("sentinelone", "f0")
     assert evicted is not None and evicted.status == "dead_lettered"
     assert summary.dead_lettered == [evicted.alert.id]
+    assert evicted.alert.id not in summary.failed
+    assert summary.processed == 3
     assert await store.has_seen("sentinelone", "f0")
     assert list(worker._retries) == ["sentinelone:f1", "sentinelone:f2"]
 
@@ -296,3 +298,30 @@ async def test_worker_skips_an_alert_the_webhook_finished_under_the_lock():
 
     assert analyst.calls == []
     assert worker._retries == {}
+
+
+async def test_summary_buckets_are_exclusive_when_dead_lettering():
+    """One alert, one bucket: a dead-lettered ID must not also read as failed."""
+    payload = {"id": "a", "observed_at": datetime.now(UTC)}
+    connector = FakeConnector([[payload]] + [[] for _ in range(6)])
+    worker = _worker(connector, FakeAnalyst(status="failed"), interval=0)
+
+    summaries = [await worker.poll_once() for _ in range(MAX_RETRY_ATTEMPTS)]
+    final = summaries[-1]
+
+    assert len(final.dead_lettered) == 1
+    assert final.failed == []
+    assert final.processed == 1
+    assert all(len(s.failed) == 1 and s.dead_lettered == [] for s in summaries[:-1])
+
+
+async def test_alert_without_source_id_is_dead_lettered_not_failed():
+    """With nothing stable to retry by, the only attempt is the last one."""
+    connector = FakeConnector([[{"id": "", "observed_at": datetime.now(UTC)}]])
+    worker = _worker(connector, FakeAnalyst(status="failed"))
+
+    summary = await worker.poll_once()
+
+    assert summary.failed == []
+    assert len(summary.dead_lettered) == 1
+    assert (await worker.store.list())[0].status == "dead_lettered"

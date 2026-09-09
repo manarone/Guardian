@@ -10,6 +10,7 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from guardian.models import TriageResult
 
@@ -87,6 +88,25 @@ class InMemoryStore:
         """Return the most recent results, newest first."""
         async with self._lock:
             return list(reversed(list(self._items.values())))[:limit]
+
+    async def find_by_host(
+        self, hostname: str, since: datetime, limit: int = 50
+    ) -> list[TriageResult]:
+        """Return results for a host observed since `since`, newest first.
+
+        Filters before it limits. Taking the newest N and then filtering would
+        let a burst of alerts from other hosts hide a genuinely related one.
+        """
+        wanted = hostname.lower()
+        async with self._lock:
+            matches = [
+                r
+                for r in reversed(self._items.values())
+                if r.alert.host.hostname
+                and r.alert.host.hostname.lower() == wanted
+                and r.alert.observed_at >= since
+            ]
+        return matches[:limit]
 
     async def get_by_source(self, source: str, source_id: str) -> TriageResult | None:
         """Return the latest attempt at a source alert, whatever its status."""

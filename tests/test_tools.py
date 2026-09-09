@@ -70,3 +70,18 @@ async def test_search_related_alerts_excludes_the_alert_under_triage():
     assert "1 alert(s)" in result
     assert "PsExec" in result
     assert "Mimikatz" not in result
+
+
+async def test_search_related_alerts_is_not_hidden_by_newer_alerts_elsewhere():
+    """A burst from other hosts must not push a related alert out of view."""
+    store = InMemoryStore()
+    related = Alert(source="m", title="Related on WIN-1", host={"hostname": "WIN-1"})
+    await store.put(TriageResult(alert=related, status="triaged"))
+    for i in range(250):
+        other = Alert(source="m", title=f"noise {i}", host={"hostname": f"OTHER-{i}"})
+        await store.put(TriageResult(alert=other, status="triaged"))
+    tool = _tool(build_tools(store, []), "search_related_alerts")
+
+    result = await tool(hostname="WIN-1")
+
+    assert "Related on WIN-1" in result

@@ -39,7 +39,8 @@ class PollSummary:
 
     @property
     def processed(self) -> int:
-        return len(self.triaged) + len(self.failed) + len(self.refused)
+        """Alerts this cycle made a model call for. Every ID is in exactly one list."""
+        return len(self.triaged) + len(self.failed) + len(self.refused) + len(self.dead_lettered)
 
 
 @dataclass
@@ -199,9 +200,10 @@ class PollingWorker:
             summary.refused.append(alert.id)
             self._clear_retry(key)
         else:
-            summary.failed.append(alert.id)
             attempts = self._schedule_retry(key, raw)
-            if attempts is not None:
+            if attempts is None:
+                summary.failed.append(alert.id)  # another attempt is coming
+            else:
                 result = self._dead_letter(result, f"after {attempts} failed triage attempt(s)")
                 summary.dead_lettered.append(alert.id)
 
@@ -269,6 +271,9 @@ class PollingWorker:
             f"retry queue exceeded {MAX_PENDING_RETRIES}; evicted after "
             f"{pending.attempts} attempt(s)",
         )
+        # It may have been counted as a retryable failure earlier this cycle.
+        if result.alert.id in summary.failed:
+            summary.failed.remove(result.alert.id)
         summary.dead_lettered.append(result.alert.id)
         await self.store.put(result)
 

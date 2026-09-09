@@ -24,7 +24,12 @@ from datetime import UTC, datetime
 
 from anthropic import AsyncAnthropic
 
-from guardian.agent.prompts import SYSTEM_PROMPT, TRIAGE_INSTRUCTION, VERDICT_INSTRUCTION
+from guardian.agent.prompts import (
+    SYSTEM_PROMPT,
+    TRIAGE_INSTRUCTION,
+    VERDICT_INSTRUCTION,
+    fence_alert,
+)
 from guardian.agent.tools import build_tools
 from guardian.config import Settings
 from guardian.models import Alert, TriageResult, Verdict
@@ -114,7 +119,10 @@ class Analyst:
             fallbacks="default",
             tools=tools,
             messages=[
-                {"role": "user", "content": TRIAGE_INSTRUCTION.format(alert=alert.summary())}
+                {
+                    "role": "user",
+                    "content": TRIAGE_INSTRUCTION.format(alert=fence_alert(alert.summary())),
+                }
             ],
         )
 
@@ -147,7 +155,10 @@ class Analyst:
             ],
             thinking={"type": "adaptive"},
             messages=[
-                {"role": "user", "content": TRIAGE_INSTRUCTION.format(alert=alert.summary())},
+                {
+                    "role": "user",
+                    "content": TRIAGE_INSTRUCTION.format(alert=fence_alert(alert.summary())),
+                },
                 {"role": "assistant", "content": investigation},
                 {"role": "user", "content": VERDICT_INSTRUCTION},
             ],

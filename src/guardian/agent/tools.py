@@ -62,16 +62,10 @@ def build_tools(store: InMemoryStore, call_log: list[str], current: Alert | None
         """
         record(f"search_related_alerts(hostname={hostname!r}, hours={hours})")
         cutoff = datetime.now(UTC) - timedelta(hours=hours)
-        results = await store.list(limit=200)
-
-        matches = [
-            r
-            for r in results
-            if not is_current(r.alert)
-            and r.alert.host.hostname
-            and r.alert.host.hostname.lower() == hostname.lower()
-            and r.alert.observed_at >= cutoff
-        ]
+        # The store filters by host and time before it limits, so a burst of
+        # alerts from other hosts cannot push a related one out of view.
+        results = await store.find_by_host(hostname, since=cutoff, limit=200)
+        matches = [r for r in results if not is_current(r.alert)]
         if not matches:
             return f"No other alerts for {hostname} in the last {hours}h."
 

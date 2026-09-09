@@ -66,6 +66,36 @@ def _authorize(request: Request, token: str | None) -> None:
         )
 
 
+async def _triage_deduped(request: Request, alert: Alert) -> IngestResponse:
+    """Triage an alert once per source ID, whichever endpoint delivered it.
+
+    Redelivery is common - vendors retry webhooks, and one can race the poller -
+    so an already-finished source alert returns its existing result rather than
+    paying for a second model call and orphaning the first alert ID. The check,
+    the model call, and the write run under one per-alert lock so two
+    deliveries arriving together cannot both pass the check.
+    """
+    store = request.app.state.store
+    analyst = request.app.state.analyst
+
+    if not alert.source_id:
+        # Nothing stable to dedupe on; every delivery is its own alert.
+        result = await analyst.triage(alert)
+        await store.put(result)
+        return IngestResponse(alert_id=alert.id, result=result)
+
+    async with store.lock_source(alert.source, alert.source_id):
+        if await store.has_seen(alert.source, alert.source_id):
+            existing = await store.get_by_source(alert.source, alert.source_id)
+            if existing is not None:
+                logger.info("Returning existing triage for %s:%s", alert.source, alert.source_id)
+                return IngestResponse(alert_id=existing.alert.id, result=existing)
+
+        result = await analyst.triage(alert)
+        await store.put(result)
+    return IngestResponse(alert_id=alert.id, result=result)
+
+
 @router.get("/healthz", response_model=HealthResponse)
 async def healthz(request: Request) -> HealthResponse:
     state = request.app.state
@@ -92,12 +122,11 @@ async def ingest_alert(
     """Triage a single alert supplied in Guardian's normalized schema.
 
     Triage runs inline so the caller gets the verdict back. For high-volume
-    webhook sources, queue here and return 202 instead.
+    webhook sources, queue here and return 202 instead. Deduplicated on
+    `source_id` when one is supplied, exactly like the vendor endpoints.
     """
     _authorize(request, x_guardian_token)
-    result = await request.app.state.analyst.triage(alert)
-    await request.app.state.store.put(result)
-    return IngestResponse(alert_id=alert.id, result=result)
+    return await _triage_deduped(request, alert)
 
 
 @router.post(
@@ -108,36 +137,9 @@ async def ingest_sentinelone_alert(
     payload: dict[str, Any],
     x_guardian_token: Annotated[str | None, Header()] = None,
 ) -> IngestResponse:
-    """Triage a raw SentinelOne threat object, normalizing it on the way in.
-
-    Redelivery is common - SentinelOne retries webhooks, and one can race the
-    poller - so an already-triaged threat returns its existing result rather
-    than paying for a second model call and orphaning the first alert ID.
-    """
+    """Triage a raw SentinelOne threat object, normalizing it on the way in."""
     _authorize(request, x_guardian_token)
-
-    alert = normalize_threat(payload)
-    store = request.app.state.store
-    analyst = request.app.state.analyst
-
-    if not alert.source_id:
-        # Nothing stable to dedupe on; every delivery is its own alert.
-        result = await analyst.triage(alert)
-        await store.put(result)
-        return IngestResponse(alert_id=alert.id, result=result)
-
-    # Check, triage, and write under one per-alert lock, so two deliveries
-    # arriving together (or one racing the poller) cannot both pass the check.
-    async with store.lock_source(alert.source, alert.source_id):
-        if await store.has_seen(alert.source, alert.source_id):
-            existing = await store.get_by_source(alert.source, alert.source_id)
-            if existing is not None:
-                logger.info("Returning existing triage for %s:%s", alert.source, alert.source_id)
-                return IngestResponse(alert_id=existing.alert.id, result=existing)
-
-        result = await analyst.triage(alert)
-        await store.put(result)
-    return IngestResponse(alert_id=alert.id, result=result)
+    return await _triage_deduped(request, normalize_threat(payload))
 
 
 @router.get("/v1/triage", response_model=list[TriageResult])

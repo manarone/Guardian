@@ -196,6 +196,20 @@ def test_concurrent_webhook_deliveries_share_one_triage(client):
     assert client.get(f"/v1/triage/{first['alert_id']}", headers=headers).status_code == 200
 
 
+def test_normalized_endpoint_dedupes_on_source_id(client):
+    """/v1/alerts must honor source_id like the vendor endpoints do, or a
+    redelivery pays twice and 404s the first caller's alert ID."""
+    alert = {"source": "crowdstrike", "source_id": "cs-7", "title": "Credential access"}
+    headers = {"X-Guardian-Token": "s3cret"}
+
+    first = client.post("/v1/alerts", json=alert, headers=headers).json()
+    second = client.post("/v1/alerts", json=alert, headers=headers).json()
+
+    assert first["alert_id"] == second["alert_id"]
+    assert len(client.app.state.analyst.calls) == 1
+    assert client.get(f"/v1/triage/{first['alert_id']}", headers=headers).status_code == 200
+
+
 def test_poll_without_a_connector_is_503(client):
     response = client.post("/v1/poll", headers={"X-Guardian-Token": "s3cret"})
     assert response.status_code == 503
