@@ -52,12 +52,19 @@ class SentinelOneConnector:
         )
 
     async def fetch_since(self, since: datetime) -> list[dict[str, Any]]:
-        """Fetch threats created after `since`, oldest first, following cursors."""
+        """Fetch threats created at or after `since`, oldest first.
+
+        The bound is inclusive (`createdAt__gte`). An exclusive bound would drop
+        a threat sharing its createdAt with the last one processed; re-reading
+        the boundary and letting the worker's dedupe discard it is the safer
+        trade for security alerting, where a missed alert costs more than a
+        repeated fetch.
+        """
         params: dict[str, Any] = {
             "limit": self.page_limit,
             "sortBy": "createdAt",
             "sortOrder": "asc",
-            "createdAt__gt": _to_s1_timestamp(since),
+            "createdAt__gte": _to_s1_timestamp(since),
         }
         threats: list[dict[str, Any]] = []
         cursor: str | None = None
@@ -117,6 +124,8 @@ def normalize_threat(raw: dict[str, Any]) -> Alert:
         description=_build_description(info),
         severity=_map_severity(info),
         observed_at=_parse_timestamp(info.get("identifiedAt") or info.get("createdAt")),
+        # Pagination is on createdAt, which trails identifiedAt - keep them apart.
+        cursor_at=_parse_timestamp(info.get("createdAt") or info.get("identifiedAt")),
         classification=info.get("classification"),
         mitre_techniques=_extract_techniques(raw.get("indicators") or []),
         indicators=indicators,
@@ -158,12 +167,14 @@ def _build_description(info: dict[str, Any]) -> str | None:
 
 
 def _map_severity(info: dict[str, Any]) -> Severity:
+    # Ransomware is escalated regardless of the engine's confidence label, so
+    # this has to come first - a "suspicious" ransomware detection is still
+    # critical.
+    if "ransomware" in (info.get("classification") or "").lower():
+        return Severity.CRITICAL
     confidence = (info.get("confidenceLevel") or "").lower()
     if confidence in _CONFIDENCE_SEVERITY:
         return _CONFIDENCE_SEVERITY[confidence]
-    # Ransomware is escalated regardless of the engine's confidence label.
-    if "ransomware" in (info.get("classification") or "").lower():
-        return Severity.CRITICAL
     return Severity.MEDIUM
 
 

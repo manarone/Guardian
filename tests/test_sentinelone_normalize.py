@@ -63,6 +63,22 @@ def test_ransomware_escalates_without_a_confidence_label():
     assert alert.severity is Severity.CRITICAL
 
 
+def test_ransomware_escalates_over_a_lower_confidence_label():
+    """Classification outranks confidence - suspicious ransomware is still critical."""
+    alert = normalize_threat(
+        {"threatInfo": {"classification": "Ransomware", "confidenceLevel": "suspicious"}}
+    )
+    assert alert.severity is Severity.CRITICAL
+
+
+def test_cursor_tracks_created_at_not_identified_at():
+    """Pagination is on createdAt; observed_at reports identifiedAt. Keep them apart."""
+    alert = normalize_threat(SAMPLE)
+
+    assert alert.observed_at.isoformat().startswith("2026-09-08T14:22:31")
+    assert alert.cursor_at.isoformat().startswith("2026-09-08T14:22:35")
+
+
 def test_multihomed_host_yields_one_indicator_per_address():
     alert = normalize_threat(
         {"agentRealtimeInfo": {"agentIpV4": "10.0.0.5, 192.168.1.9"}, "threatInfo": {}}

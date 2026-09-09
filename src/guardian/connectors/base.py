@@ -18,7 +18,13 @@ class Connector(Protocol):
     name: str
 
     async def fetch_since(self, since: datetime) -> list[dict[str, Any]]:
-        """Return raw vendor payloads created after `since`, oldest first."""
+        """Return raw vendor payloads at or after `since`, oldest first.
+
+        The bound is inclusive, so no alert is lost to a timestamp tie at the
+        batch boundary. Re-delivered alerts are dropped by the worker's dedupe.
+        Implementations should set `Alert.cursor_at` to whichever field they
+        paginate on.
+        """
         ...
 
     def normalize(self, raw: dict[str, Any]) -> Alert:

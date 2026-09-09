@@ -2,9 +2,10 @@ from guardian.models import Alert, TriageResult
 from guardian.store import InMemoryStore
 
 
-def _result(source_id: str) -> TriageResult:
+def _result(source_id: str, status: str = "triaged") -> TriageResult:
     return TriageResult(
-        alert=Alert(source="sentinelone", source_id=source_id, title=f"a{source_id}")
+        alert=Alert(source="sentinelone", source_id=source_id, title=f"a{source_id}"),
+        status=status,
     )
 
 
@@ -34,3 +35,32 @@ async def test_eviction_drops_oldest_and_forgets_it():
     assert len(await store.list()) == 2
     assert not await store.has_seen("sentinelone", "0")
     assert await store.has_seen("sentinelone", "2")
+
+
+async def test_failed_triage_is_not_marked_seen():
+    """A transient failure must stay eligible for retry, not be skipped forever."""
+    store = InMemoryStore()
+    await store.put(_result("1", status="failed"))
+
+    assert not await store.has_seen("sentinelone", "1")
+
+
+async def test_refusal_is_terminal():
+    """A refusal needs a human, not a retry - retrying just burns tokens."""
+    store = InMemoryStore()
+    await store.put(_result("1", status="refused"))
+
+    assert await store.has_seen("sentinelone", "1")
+
+
+async def test_retry_supersedes_the_failed_attempt():
+    store = InMemoryStore()
+    failed = _result("1", status="failed")
+    await store.put(failed)
+
+    retry = _result("1", status="triaged")
+    await store.put(retry)
+
+    assert await store.has_seen("sentinelone", "1")
+    assert (await store.get(failed.alert.id)) is None
+    assert len(await store.list()) == 1

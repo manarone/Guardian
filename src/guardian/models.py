@@ -74,6 +74,16 @@ class Alert(BaseModel):
     severity: Severity = Severity.MEDIUM
     observed_at: datetime = Field(default_factory=_utcnow)
     received_at: datetime = Field(default_factory=_utcnow)
+    cursor_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Value of the field the source paginates on, which is not always "
+            "`observed_at`. SentinelOne pages on createdAt but reports "
+            "identifiedAt as the detection time, and the two differ. The worker "
+            "advances its high-water mark with this so the cursor always speaks "
+            "the source's own units."
+        ),
+    )
 
     host: Host = Field(default_factory=Host)
     process: Process = Field(default_factory=Process)

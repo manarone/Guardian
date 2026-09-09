@@ -36,6 +36,15 @@ logger = logging.getLogger(__name__)
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 
+class RefusedError(Exception):
+    """The model declined to analyze this alert.
+
+    Distinct from a failure: a refusal is a policy decision that needs a human,
+    whereas a failure is something to retry or fix. Raised only on an actual
+    `stop_reason == "refusal"` - an empty or malformed response is a failure.
+    """
+
+
 class Analyst:
     def __init__(
         self,
@@ -56,19 +65,12 @@ class Analyst:
 
         try:
             investigation = await self._investigate(alert, tools)
-            if investigation is None:
-                result.status = "refused"
-                result.error = "Model declined to analyze this alert; needs human review."
-                return result
-
-            verdict = await self._render_verdict(alert, investigation)
-            if verdict is None:
-                result.status = "refused"
-                result.error = "Model declined to produce a verdict; needs human review."
-                return result
-
-            result.verdict = verdict
+            result.verdict = await self._render_verdict(alert, investigation)
             result.status = "triaged"
+        except RefusedError as exc:
+            logger.warning("Triage refused for alert %s: %s", alert.id, exc)
+            result.status = "refused"
+            result.error = f"{exc}; needs human review."
         except Exception as exc:  # surfaced on the result, never swallowed
             logger.exception("Triage failed for alert %s", alert.id)
             result.status = "failed"
@@ -79,8 +81,15 @@ class Analyst:
 
         return result
 
-    async def _investigate(self, alert: Alert, tools: list) -> str | None:
-        """Run the enrichment tool loop. Returns the investigation text, or None if refused."""
+    async def _investigate(self, alert: Alert, tools: list) -> str:
+        """Run the enrichment tool loop and return the investigation text.
+
+        Raises:
+            RefusedError: the model declined to analyze the alert.
+            RuntimeError: the turn ended without usable text, e.g. it hit
+                `max_tokens` before writing any. That is a failure to fix, not a
+                refusal, so it must not be reported as one.
+        """
         runner = self.client.beta.messages.tool_runner(
             model=self.settings.model,
             max_tokens=self.settings.max_tokens,
@@ -105,18 +114,21 @@ class Analyst:
 
         final = await runner.until_done()
         if final.stop_reason == "refusal":
-            logger.warning(
-                "Investigation refused for alert %s (%s)",
-                alert.id,
-                getattr(final.stop_details, "category", None),
-            )
-            return None
+            category = getattr(final.stop_details, "category", None)
+            raise RefusedError(f"Model declined to analyze this alert (category={category})")
 
         text = "\n".join(b.text for b in final.content if b.type == "text").strip()
-        return text or None
+        if not text:
+            raise RuntimeError(f"Investigation returned no text (stop_reason={final.stop_reason})")
+        return text
 
-    async def _render_verdict(self, alert: Alert, investigation: str) -> Verdict | None:
-        """Convert the investigation into a schema-valid verdict."""
+    async def _render_verdict(self, alert: Alert, investigation: str) -> Verdict:
+        """Convert the investigation into a schema-valid verdict.
+
+        Raises:
+            RefusedError: the model declined to produce a verdict.
+            RuntimeError: the response carried no parsable verdict.
+        """
         response = await self.client.messages.parse(
             model=self.settings.model,
             max_tokens=self.settings.max_tokens,
@@ -136,6 +148,14 @@ class Analyst:
             output_format=Verdict,
         )
         if response.stop_reason == "refusal":
-            logger.warning("Verdict refused for alert %s", alert.id)
-            return None
+            category = getattr(response.stop_details, "category", None)
+            raise RefusedError(f"Model declined to produce a verdict (category={category})")
+
+        # `parsed_output` is None when the response carried no text block at all;
+        # malformed JSON raises during validation and lands in the failure path.
+        if response.parsed_output is None:
+            raise RuntimeError(
+                f"Verdict response contained no parsable output "
+                f"(stop_reason={response.stop_reason})"
+            )
         return response.parsed_output

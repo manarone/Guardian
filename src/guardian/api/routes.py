@@ -38,10 +38,21 @@ class IngestResponse(BaseModel):
 
 
 def _authorize(request: Request, token: str | None) -> None:
-    """Constant-time check of the shared webhook secret, when one is configured."""
-    expected = request.app.state.settings.webhook_token
+    """Constant-time check of the shared webhook secret.
+
+    Startup already refuses an unset token, so reaching the no-token branch here
+    means the development opt-out is on; anything else is a misconfiguration and
+    is rejected rather than waved through.
+    """
+    settings = request.app.state.settings
+    expected = settings.webhook_token
     if not expected:
-        return
+        if settings.allow_unauthenticated:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server misconfigured: no webhook token is set",
+        )
     if not token or not hmac.compare_digest(token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing X-Guardian-Token"

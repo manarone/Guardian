@@ -41,7 +41,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 cp .env.example .env      # add your ANTHROPIC_API_KEY and SentinelOne token
-guardian                  # or: uvicorn guardian.api.app:app --reload
+guardian                  # or: uvicorn --factory guardian.api.app:create_app --reload
 ```
 
 Guardian runs without SentinelOne credentials — it just won't poll. Push an
@@ -85,9 +85,10 @@ curl -X POST localhost:8000/v1/alerts/sentinelone \
 
 Interactive docs at `/docs` while the service is running.
 
-Writing endpoints require the `X-Guardian-Token` header when
-`GUARDIAN_WEBHOOK_TOKEN` is set. **It is unset by default, which leaves those
-endpoints open — set it before exposing Guardian to anything.**
+Write endpoints require the `X-Guardian-Token` header. Guardian **refuses to
+start** without `GUARDIAN_WEBHOOK_TOKEN` set, so an unconfigured deployment
+fails closed rather than accepting anonymous alerts. For local development,
+`GUARDIAN_ALLOW_UNAUTHENTICATED=true` opts out explicitly.
 
 ## Configuration
 
@@ -103,7 +104,8 @@ See `.env.example`. The Anthropic API key is the exception: the SDK reads
 | `GUARDIAN_S1_API_TOKEN` | — | SentinelOne API token |
 | `GUARDIAN_S1_POLL_INTERVAL` | `60` | Seconds between polls |
 | `GUARDIAN_S1_POLL_ENABLED` | `true` | Disable to run webhook-only |
-| `GUARDIAN_WEBHOOK_TOKEN` | — | Shared secret for write endpoints |
+| `GUARDIAN_WEBHOOK_TOKEN` | — | Shared secret for write endpoints (required) |
+| `GUARDIAN_ALLOW_UNAUTHENTICATED` | `false` | Dev-only opt-out of the above |
 
 ## Development
 

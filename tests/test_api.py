@@ -102,3 +102,24 @@ def test_unknown_alert_id_is_404(client):
 def test_poll_without_a_connector_is_503(client):
     response = client.post("/v1/poll", headers={"X-Guardian-Token": "s3cret"})
     assert response.status_code == 503
+
+
+def test_startup_fails_closed_without_a_webhook_token():
+    """An unconfigured deployment must refuse to start, not accept anonymous alerts."""
+    with pytest.raises(RuntimeError, match="GUARDIAN_WEBHOOK_TOKEN"):
+        create_app(Settings(s1_poll_enabled=False, webhook_token="", _env_file=None))
+
+
+def test_explicit_dev_opt_out_allows_unauthenticated_writes():
+    settings = Settings(
+        s1_poll_enabled=False,
+        webhook_token="",
+        allow_unauthenticated=True,
+        _env_file=None,
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        client.app.state.analyst = StubAnalyst()
+        response = client.post("/v1/alerts", json={"source": "manual", "title": "x"})
+
+    assert response.status_code == 201
