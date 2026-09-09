@@ -165,7 +165,10 @@ class TriageResult(BaseModel):
 
     alert: Alert
     verdict: Verdict | None = None
-    status: Literal["pending", "triaged", "failed", "refused"] = "pending"
+    status: Literal["pending", "triaged", "failed", "refused", "dead_lettered"] = "pending"
+    # `failed` means another attempt is coming; `dead_lettered` means Guardian
+    # gave up (retry ceiling, queue overflow, or nothing stable to retry by)
+    # and a human has to pick it up. Only the latter counts as seen.
     error: str | None = None
     enrichment_log: list[str] = Field(
         default_factory=list, description="Tool calls the agent made, for audit"

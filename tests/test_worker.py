@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from guardian.models import Alert, TriageResult
 from guardian.store import InMemoryStore
-from guardian.worker import PollingWorker
+from guardian.worker import MAX_RETRY_ATTEMPTS, PollingWorker
 
 
 class FakeConnector:
@@ -233,3 +233,66 @@ async def test_refused_is_reported_separately_and_not_retried():
 
     assert len(summary.refused) == 1
     assert analyst.calls == ["a"]
+
+
+async def test_dead_lettered_boundary_alert_is_not_retriaged():
+    """A dead-lettered alert that sits on the inclusive cursor boundary keeps
+    coming back from the source; it must be treated as seen, not restarted."""
+    payload = {"id": "a", "observed_at": datetime.now(UTC)}
+    connector = FakeConnector([[payload] for _ in range(12)])
+    store = InMemoryStore()
+    analyst = FakeAnalyst(status="failed")
+    worker = _worker(connector, analyst, store, interval=0)
+
+    for _ in range(12):
+        await worker.poll_once()
+
+    assert len(analyst.calls) == MAX_RETRY_ATTEMPTS
+    assert await store.has_seen("sentinelone", "a")
+    stored = await store.get_by_source("sentinelone", "a")
+    assert stored is not None and stored.status == "dead_lettered"
+    assert "dead-lettered" in (stored.error or "")
+
+
+async def test_retry_queue_overflow_is_dead_lettered(monkeypatch):
+    """An alert evicted from a full queue is gone for good, so say so."""
+    monkeypatch.setattr("guardian.worker.MAX_PENDING_RETRIES", 2)
+    base = datetime.now(UTC) - timedelta(minutes=10)
+    batch = [
+        {"id": f"f{i}", "observed_at": base, "cursor_at": base + timedelta(seconds=i)}
+        for i in range(3)
+    ]
+    connector = FakeConnector([batch, []])
+    store = InMemoryStore()
+    worker = _worker(connector, FakeAnalyst(status="failed"), store, interval=3600)
+
+    summary = await worker.poll_once()
+
+    evicted = await store.get_by_source("sentinelone", "f0")
+    assert evicted is not None and evicted.status == "dead_lettered"
+    assert summary.dead_lettered == [evicted.alert.id]
+    assert await store.has_seen("sentinelone", "f0")
+    assert list(worker._retries) == ["sentinelone:f1", "sentinelone:f2"]
+
+
+async def test_worker_skips_an_alert_the_webhook_finished_under_the_lock():
+    """The poller and the webhook share one lock per source alert; whoever
+    gets it second must re-check instead of paying for a second triage."""
+    payload = {"id": "a", "observed_at": datetime.now(UTC)}
+    connector = FakeConnector([[payload]])
+    store = InMemoryStore()
+    analyst = FakeAnalyst()
+    worker = _worker(connector, analyst, store)
+
+    async def webhook_wins():
+        async with store.lock_source("sentinelone", "a"):
+            await asyncio.sleep(0.05)
+            alert = Alert(source="sentinelone", source_id="a", title="a")
+            await store.put(TriageResult(alert=alert, status="triaged"))
+
+    holder = asyncio.create_task(webhook_wins())
+    await asyncio.sleep(0)  # let the webhook take the lock first
+    await asyncio.gather(holder, worker.poll_once())
+
+    assert analyst.calls == []
+    assert worker._retries == {}

@@ -1,5 +1,8 @@
 """API tests. The analyst is stubbed - these never call the Claude API."""
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -11,11 +14,14 @@ from guardian.models import Alert, Disposition, Severity, TriageResult, Verdict
 class StubAnalyst:
     """Stands in for `Analyst`, returning a fixed verdict."""
 
-    def __init__(self):
+    def __init__(self, delay: float = 0.0):
         self.calls: list[Alert] = []
+        self.delay = delay
 
     async def triage(self, alert: Alert) -> TriageResult:
         self.calls.append(alert)
+        if self.delay:
+            await asyncio.sleep(self.delay)
         return TriageResult(
             alert=alert,
             status="triaged",
@@ -55,17 +61,23 @@ def test_healthz_counts_only_verdicts_as_triaged(client):
     store = client.app.state.store
 
     async def seed():
-        for title, status in [("ok", "triaged"), ("bad", "failed"), ("no", "refused")]:
+        for title, status in [
+            ("ok", "triaged"),
+            ("bad", "failed"),
+            ("no", "refused"),
+            ("gave-up", "dead_lettered"),
+        ]:
             await store.put(TriageResult(alert=Alert(source="m", title=title), status=status))
 
     # The store is async and the TestClient is sync; go through its portal.
     client.portal.call(seed)
 
     body = client.get("/healthz").json()
-    assert body["stored_count"] == 3
+    assert body["stored_count"] == 4
     assert body["triaged_count"] == 1
     assert body["failed_count"] == 1
     assert body["refused_count"] == 1
+    assert body["dead_lettered_count"] == 1
 
 
 def test_naive_timestamps_are_accepted_and_normalized(client):
@@ -101,6 +113,17 @@ def test_ingest_triages_and_stores_an_alert(client):
 def test_ingest_rejects_a_bad_token(client):
     response = client.post(
         "/v1/alerts", json={"source": "manual", "title": "x"}, headers={"X-Guardian-Token": "wrong"}
+    )
+    assert response.status_code == 401
+
+
+def test_ingest_rejects_a_non_ascii_token_with_401(client):
+    """Starlette hands header values over as latin-1 str; `compare_digest`
+    refuses non-ASCII str, which used to surface as a 500 instead of a 401."""
+    response = client.post(
+        "/v1/alerts",
+        json={"source": "manual", "title": "x"},
+        headers={b"X-Guardian-Token": "s3cr\u00e9t".encode("latin-1")},
     )
     assert response.status_code == 401
 
@@ -153,6 +176,24 @@ def test_sentinelone_webhook_redelivery_reuses_the_existing_result(client):
 
     assert first["alert_id"] == second["alert_id"]
     assert len(client.app.state.analyst.calls) == 1
+
+
+def test_concurrent_webhook_deliveries_share_one_triage(client):
+    """Two deliveries of the same threat in flight together must produce one
+    triage and one alert ID, not a superseded first result that 404s."""
+    client.app.state.analyst = StubAnalyst(delay=0.1)
+    payload = {"id": "race-1", "threatInfo": {"threatName": "evil.exe"}}
+    headers = {"X-Guardian-Token": "s3cret"}
+
+    def deliver():
+        return client.post("/v1/alerts/sentinelone", json=payload, headers=headers).json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(lambda _: deliver(), range(2)))
+
+    assert first["alert_id"] == second["alert_id"]
+    assert len(client.app.state.analyst.calls) == 1
+    assert client.get(f"/v1/triage/{first['alert_id']}", headers=headers).status_code == 200
 
 
 def test_poll_without_a_connector_is_503(client):

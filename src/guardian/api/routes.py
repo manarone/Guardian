@@ -34,6 +34,7 @@ class HealthResponse(BaseModel):
     triaged_count: int
     failed_count: int
     refused_count: int
+    dead_lettered_count: int
 
 
 class IngestResponse(BaseModel):
@@ -57,7 +58,9 @@ def _authorize(request: Request, token: str | None) -> None:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Server misconfigured: no webhook token is set",
         )
-    if not token or not hmac.compare_digest(token, expected):
+    # Starlette decodes header values as latin-1, so a non-ASCII token arrives
+    # as a str that `compare_digest` refuses to compare. Bytes always compare.
+    if not token or not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing X-Guardian-Token"
         )
@@ -76,6 +79,7 @@ async def healthz(request: Request) -> HealthResponse:
         triaged_count=sum(1 for r in results if r.status == "triaged"),
         failed_count=sum(1 for r in results if r.status == "failed"),
         refused_count=sum(1 for r in results if r.status == "refused"),
+        dead_lettered_count=sum(1 for r in results if r.status == "dead_lettered"),
     )
 
 
@@ -114,15 +118,25 @@ async def ingest_sentinelone_alert(
 
     alert = normalize_threat(payload)
     store = request.app.state.store
+    analyst = request.app.state.analyst
 
-    if alert.source_id and await store.has_seen(alert.source, alert.source_id):
-        existing = await store.get_by_source(alert.source, alert.source_id)
-        if existing is not None:
-            logger.info("Returning existing triage for %s:%s", alert.source, alert.source_id)
-            return IngestResponse(alert_id=existing.alert.id, result=existing)
+    if not alert.source_id:
+        # Nothing stable to dedupe on; every delivery is its own alert.
+        result = await analyst.triage(alert)
+        await store.put(result)
+        return IngestResponse(alert_id=alert.id, result=result)
 
-    result = await request.app.state.analyst.triage(alert)
-    await store.put(result)
+    # Check, triage, and write under one per-alert lock, so two deliveries
+    # arriving together (or one racing the poller) cannot both pass the check.
+    async with store.lock_source(alert.source, alert.source_id):
+        if await store.has_seen(alert.source, alert.source_id):
+            existing = await store.get_by_source(alert.source, alert.source_id)
+            if existing is not None:
+                logger.info("Returning existing triage for %s:%s", alert.source, alert.source_id)
+                return IngestResponse(alert_id=existing.alert.id, result=existing)
+
+        result = await analyst.triage(alert)
+        await store.put(result)
     return IngestResponse(alert_id=alert.id, result=result)
 
 
@@ -169,4 +183,5 @@ async def poll_now(
         "triaged": summary.triaged,
         "failed": summary.failed,
         "refused": summary.refused,
+        "dead_lettered": summary.dead_lettered,
     }

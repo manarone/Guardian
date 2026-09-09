@@ -11,7 +11,7 @@ from typing import Any
 
 from guardian.agent.analyst import Analyst
 from guardian.connectors.base import Connector
-from guardian.models import Alert
+from guardian.models import Alert, TriageResult
 from guardian.store import InMemoryStore
 
 logger = logging.getLogger(__name__)
@@ -169,12 +169,27 @@ class PollingWorker:
     async def _triage_one(
         self, raw: dict[str, Any], summary: PollSummary, alert: Alert | None = None
     ) -> None:
-        """Triage one payload and record the outcome, scheduling a retry if needed."""
+        """Triage one payload under its source lock and record the outcome."""
         alert = alert if alert is not None else self.connector.normalize(raw)
         key = self._retry_key(alert)
+        source_id = alert.source_id
 
+        if key is None or not source_id:
+            await self._triage_and_record(alert, raw, key, summary)
+            return
+
+        async with self.store.lock_source(alert.source, source_id):
+            # Re-check now that we hold the lock: a webhook delivery of this
+            # same threat may have finished while we waited for it.
+            if await self.store.has_seen(alert.source, source_id):
+                self._clear_retry(key)
+                return
+            await self._triage_and_record(alert, raw, key, summary)
+
+    async def _triage_and_record(
+        self, alert: Alert, raw: dict[str, Any], key: str | None, summary: PollSummary
+    ) -> None:
         result = await self.analyst.triage(alert)
-        await self.store.put(result)
 
         if result.status == "triaged":
             summary.triaged.append(alert.id)
@@ -185,18 +200,32 @@ class PollingWorker:
             self._clear_retry(key)
         else:
             summary.failed.append(alert.id)
-            if not self._schedule_retry(key, raw):
+            attempts = self._schedule_retry(key, raw)
+            if attempts is not None:
+                result = self._dead_letter(result, f"after {attempts} failed triage attempt(s)")
                 summary.dead_lettered.append(alert.id)
+
+        await self.store.put(result)
+
+        # Queuing this alert may have pushed the oldest one out. That one is
+        # gone from the queue and the cursor is already past it, so record it
+        # as dead-lettered rather than leaving a failed result nobody revisits.
+        for dropped_key, dropped in self._evict_overflow():
+            await self._dead_letter_evicted(dropped_key, dropped, summary)
 
     def _due_retries(self) -> list[dict[str, Any]]:
         now = datetime.now(UTC)
         return [p.raw for p in list(self._retries.values()) if p.next_attempt <= now]
 
-    def _schedule_retry(self, key: str | None, raw: dict[str, Any]) -> bool:
-        """Queue another attempt. Returns False when the alert is dead-lettered."""
+    def _schedule_retry(self, key: str | None, raw: dict[str, Any]) -> int | None:
+        """Queue another attempt.
+
+        Returns None when a retry is scheduled, or the attempt count when the
+        alert is being given up on and must be dead-lettered instead.
+        """
         if key is None:
-            # No stable source ID to retry against; the failed result is stored.
-            return False
+            # No stable source ID to retry against, so this was the only try.
+            return 1
 
         pending = self._retries.get(key) or _PendingRetry(raw=raw)
         pending.attempts += 1
@@ -209,17 +238,47 @@ class PollingWorker:
                 key,
                 pending.attempts,
             )
-            return False
+            return pending.attempts
 
         backoff = min(timedelta(seconds=self.interval * (2**pending.attempts)), MAX_RETRY_BACKOFF)
         pending.next_attempt = datetime.now(UTC) + backoff
         self._retries[key] = pending
         self._retries.move_to_end(key)
+        return None
 
+    def _evict_overflow(self) -> list[tuple[str, _PendingRetry]]:
+        evicted: list[tuple[str, _PendingRetry]] = []
         while len(self._retries) > MAX_PENDING_RETRIES:
-            dropped, _ = self._retries.popitem(last=False)
-            logger.error("Retry queue full; dropping %s without a verdict", dropped)
-        return True
+            key, pending = self._retries.popitem(last=False)
+            logger.error("Retry queue full; dead-lettering %s without a verdict", key)
+            evicted.append((key, pending))
+        return evicted
+
+    async def _dead_letter_evicted(
+        self, key: str, pending: _PendingRetry, summary: PollSummary
+    ) -> None:
+        alert = self.connector.normalize(pending.raw)
+        # Prefer the stored attempt so its error and audit trail survive; fall
+        # back to a fresh record only if the store already evicted it.
+        existing = None
+        if alert.source_id:
+            existing = await self.store.get_by_source(alert.source, alert.source_id)
+        result = existing or TriageResult(alert=alert, status="failed", model=None)
+        result = self._dead_letter(
+            result,
+            f"retry queue exceeded {MAX_PENDING_RETRIES}; evicted after "
+            f"{pending.attempts} attempt(s)",
+        )
+        summary.dead_lettered.append(result.alert.id)
+        await self.store.put(result)
+
+    @staticmethod
+    def _dead_letter(result: TriageResult, reason: str) -> TriageResult:
+        """Return a terminal copy of a failed result so dedupe stops retrying it."""
+        error = f"{result.error}; " if result.error else ""
+        return result.model_copy(
+            update={"status": "dead_lettered", "error": f"{error}dead-lettered {reason}"}
+        )
 
     def _clear_retry(self, key: str | None) -> None:
         if key is not None:

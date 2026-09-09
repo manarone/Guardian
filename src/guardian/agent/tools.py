@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 from anthropic import beta_async_tool
 
+from guardian.models import Alert
 from guardian.store import InMemoryStore
 
 logger = logging.getLogger(__name__)
@@ -24,16 +25,29 @@ NOT_CONFIGURED = (
 )
 
 
-def build_tools(store: InMemoryStore, call_log: list[str]) -> list:
+def build_tools(store: InMemoryStore, call_log: list[str], current: Alert | None = None) -> list:
     """Build the agent's tool list, bound to a store and an audit log.
 
     `call_log` accumulates one line per tool call so the triage result carries a
-    reviewable trail of what the agent looked at.
+    reviewable trail of what the agent looked at. `current` is the alert under
+    triage; its own earlier attempts are hidden from `search_related_alerts` so
+    a retry cannot cite itself as corroborating activity.
     """
 
     def record(line: str) -> None:
         logger.info("enrichment: %s", line)
         call_log.append(line)
+
+    def is_current(candidate: Alert) -> bool:
+        if current is None:
+            return False
+        if candidate.id == current.id:
+            return True
+        return bool(
+            current.source_id
+            and candidate.source == current.source
+            and candidate.source_id == current.source_id
+        )
 
     @beta_async_tool
     async def search_related_alerts(hostname: str, hours: int = 24) -> str:
@@ -53,7 +67,8 @@ def build_tools(store: InMemoryStore, call_log: list[str]) -> list:
         matches = [
             r
             for r in results
-            if r.alert.host.hostname
+            if not is_current(r.alert)
+            and r.alert.host.hostname
             and r.alert.host.hostname.lower() == hostname.lower()
             and r.alert.observed_at >= cutoff
         ]

@@ -67,7 +67,7 @@ class Analyst:
     async def triage(self, alert: Alert) -> TriageResult:
         result = TriageResult(alert=alert, model=self.settings.model)
         call_log: list[str] = []
-        tools = build_tools(self.store, call_log)
+        tools = build_tools(self.store, call_log, current=alert)
 
         try:
             investigation = await self._investigate(alert, tools)

@@ -44,3 +44,29 @@ async def test_search_related_alerts_records_the_call_for_audit():
     await tool(hostname="WIN-2")
 
     assert log and "search_related_alerts" in log[0]
+
+
+async def test_search_related_alerts_excludes_the_alert_under_triage():
+    """A retry must not find its own failed first attempt and call it
+    corroborating activity on the host."""
+    store = InMemoryStore()
+    first_try = Alert(
+        source="sentinelone", source_id="t-1", title="Mimikatz", host={"hostname": "WIN-1"}
+    )
+    await store.put(TriageResult(alert=first_try, status="failed", error="timeout"))
+    unrelated = Alert(
+        source="sentinelone", source_id="t-2", title="PsExec", host={"hostname": "WIN-1"}
+    )
+    await store.put(TriageResult(alert=unrelated, status="triaged"))
+
+    # Same source alert, new Guardian ID - exactly what a retry looks like.
+    retry = Alert(
+        source="sentinelone", source_id="t-1", title="Mimikatz", host={"hostname": "WIN-1"}
+    )
+    tool = _tool(build_tools(store, [], current=retry), "search_related_alerts")
+
+    result = await tool(hostname="WIN-1")
+
+    assert "1 alert(s)" in result
+    assert "PsExec" in result
+    assert "Mimikatz" not in result
