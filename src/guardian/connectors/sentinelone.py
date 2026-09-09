@@ -85,6 +85,11 @@ class SentinelOneConnector:
         logger.info("Fetched %d SentinelOne threats since %s", len(threats), since.isoformat())
         return threats
 
+    def identify(self, raw: Any) -> str | None:
+        if isinstance(raw, dict) and raw.get("id") is not None:
+            return str(raw["id"])
+        return None
+
     def normalize(self, raw: dict[str, Any]) -> Alert:
         return normalize_threat(raw)
 

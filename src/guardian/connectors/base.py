@@ -31,6 +31,15 @@ class Connector(Protocol):
         """Map one raw vendor payload into Guardian's schema."""
         ...
 
+    def identify(self, raw: Any) -> str | None:
+        """Best-effort vendor ID for a payload `normalize` could not handle.
+
+        Lets the worker quarantine a malformed record under a stable identity
+        so it is skipped on the next fetch instead of blocking the batch.
+        Return None if nothing usable can be read.
+        """
+        ...
+
     async def aclose(self) -> None:
         """Release any underlying HTTP resources."""
         ...

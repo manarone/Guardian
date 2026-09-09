@@ -22,6 +22,8 @@ class FakeConnector:
         return self._batches.pop(0) if self._batches else []
 
     def normalize(self, raw):
+        if raw.get("malformed"):
+            raise ValueError("threatInfo is not an object")
         return Alert(
             source=self.name,
             source_id=raw["id"],
@@ -29,6 +31,9 @@ class FakeConnector:
             observed_at=raw["observed_at"],
             cursor_at=raw.get("cursor_at"),
         )
+
+    def identify(self, raw):
+        return raw.get("id") or None
 
     async def aclose(self):
         pass
@@ -377,3 +382,49 @@ async def test_processed_counts_model_calls_not_evictions(monkeypatch):
     assert len(summary.failed) == 1  # 'b'
     assert len(summary.dead_lettered) == 1  # 'a', evicted without a call
     assert summary.processed == 1
+
+
+async def test_a_malformed_record_is_quarantined_not_batch_blocking():
+    """One record that fails to normalize must not stop the ones behind it,
+    or pin the cursor so the source returns it forever."""
+    base = datetime.now(UTC) - timedelta(minutes=10)
+    batch = [
+        {"id": "ok1", "observed_at": base, "cursor_at": base},
+        {"id": "bad", "malformed": True},
+        {"id": "ok2", "observed_at": base, "cursor_at": base + timedelta(seconds=2)},
+    ]
+    connector = FakeConnector([batch, [batch[1]]])
+    store = InMemoryStore()
+    analyst = FakeAnalyst()
+    worker = _worker(connector, analyst, store)
+
+    summary = await worker.poll_once()
+
+    assert analyst.calls == ["ok1", "ok2"]
+    assert worker._since == base + timedelta(seconds=2)
+    quarantined = await store.get_by_source("sentinelone", "bad")
+    assert quarantined is not None and quarantined.status == "dead_lettered"
+    assert "normalize failed" in (quarantined.error or "")
+    assert summary.dead_lettered == [quarantined.alert.id]
+
+    # Refetched on the boundary next cycle: already quarantined, nothing new.
+    second = await worker.poll_once()
+    assert second.dead_lettered == []
+    assert len(await store.list()) == 3
+
+
+async def test_retry_keeps_the_original_alert_id():
+    """The ID a caller saw in `failed` must still resolve after the retry."""
+    payload = {"id": "a", "observed_at": datetime.now(UTC)}
+    connector = FakeConnector([[payload], []])
+    store = InMemoryStore()
+    worker = _worker(connector, FakeAnalyst(status="failed"), store, interval=0)
+
+    first = await worker.poll_once()
+    worker.analyst = FakeAnalyst(status="triaged")
+    second = await worker.poll_once()
+
+    (alert_id,) = first.failed
+    assert second.triaged == [alert_id]
+    stored = await store.get(alert_id)
+    assert stored is not None and stored.status == "triaged"

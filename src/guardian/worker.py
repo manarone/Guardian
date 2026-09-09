@@ -49,9 +49,15 @@ class PollSummary:
 
 @dataclass
 class _PendingRetry:
-    """A failed alert awaiting another attempt."""
+    """A failed alert awaiting another attempt.
+
+    `alert_id` is the Guardian ID the first attempt was stored under. Every
+    retry reuses it, so an ID a caller saw in a poll summary keeps resolving
+    through failure, retry, and the terminal result.
+    """
 
     raw: dict[str, Any]
+    alert_id: str
     attempts: int = 0
     next_attempt: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -133,14 +139,21 @@ class PollingWorker:
         summary = PollSummary()
 
         # Retries first, so a backlog drains even while new alerts keep arriving.
-        for raw in self._due_retries():
-            await self._triage_one(raw, summary)
+        for pending in self._due_retries():
+            alert = await self._normalize(pending.raw, summary)
+            if alert is None:
+                self._retries.pop(self._retry_key_from_raw(pending), None)
+                continue
+            alert = alert.model_copy(update={"id": pending.alert_id})
+            await self._triage_one(alert, pending.raw, summary)
 
         raw_alerts = await self.connector.fetch_since(self._since)
         batch_cursor = self._since
 
         for raw in raw_alerts:
-            alert = self.connector.normalize(raw)
+            alert = await self._normalize(raw, summary)
+            if alert is None:
+                continue  # quarantined; the rest of the batch still proceeds
             # Advance only on the source's own pagination field. An alert
             # without one holds the cursor: guessing (say, from wall-clock
             # time) could jump past alerts the source has not shown us yet.
@@ -159,7 +172,7 @@ class PollingWorker:
             if alert.source_id and await self.store.has_seen(alert.source, alert.source_id):
                 continue
 
-            await self._triage_one(raw, summary, alert=alert)
+            await self._triage_one(alert, raw, summary)
 
         # Commit the watermark once, after the batch. If this cycle raises
         # partway, `_since` is untouched and the next cycle refetches; dedupe
@@ -179,11 +192,44 @@ class PollingWorker:
             )
         return summary
 
-    async def _triage_one(
-        self, raw: dict[str, Any], summary: PollSummary, alert: Alert | None = None
-    ) -> None:
-        """Triage one payload under its source lock and record the outcome."""
-        alert = alert if alert is not None else self.connector.normalize(raw)
+    async def _normalize(self, raw: Any, summary: PollSummary) -> Alert | None:
+        """Normalize one payload, quarantining it if the connector cannot.
+
+        A record that raises must not abort the batch: the fetch is inclusive,
+        so the same record would come back on every cycle and everything
+        behind it would never reach triage. It is stored as dead-lettered
+        under whatever identity the connector can still read, which also
+        makes the next fetch skip it.
+        """
+        try:
+            return self.connector.normalize(raw)
+        except Exception as exc:
+            source_id = self.connector.identify(raw)
+            logger.exception(
+                "%s record %s could not be normalized; quarantining it",
+                self.connector.name,
+                source_id or "<no id>",
+            )
+            if source_id and await self.store.has_seen(self.connector.name, source_id):
+                return None  # already quarantined on an earlier cycle
+
+            alert = Alert(
+                source=self.connector.name,
+                source_id=source_id,
+                title=f"Unparseable {self.connector.name} record",
+                raw=raw if isinstance(raw, dict) else {"payload": repr(raw)[:2000]},
+            )
+            result = TriageResult(
+                alert=alert,
+                status="dead_lettered",
+                error=f"normalize failed: {type(exc).__name__}: {exc}",
+            )
+            await self.store.put(result)
+            summary.dead_lettered.append(alert.id)
+            return None
+
+    async def _triage_one(self, alert: Alert, raw: dict[str, Any], summary: PollSummary) -> None:
+        """Triage one alert under its source lock and record the outcome."""
         key = self._retry_key(alert)
         source_id = alert.source_id
 
@@ -213,7 +259,7 @@ class PollingWorker:
             summary.refused.append(alert.id)
             self._clear_retry(key)
         else:
-            attempts = self._schedule_retry(key, raw)
+            attempts = self._schedule_retry(key, raw, alert.id)
             if attempts is None:
                 summary.failed.append(alert.id)  # another attempt is coming
             else:
@@ -228,11 +274,13 @@ class PollingWorker:
         for dropped_key, dropped in self._evict_overflow():
             await self._dead_letter_evicted(dropped_key, dropped, summary)
 
-    def _due_retries(self) -> list[dict[str, Any]]:
+    def _due_retries(self) -> list[_PendingRetry]:
         now = datetime.now(UTC)
-        return [p.raw for p in list(self._retries.values()) if p.next_attempt <= now]
+        return [p for p in list(self._retries.values()) if p.next_attempt <= now]
 
-    def _schedule_retry(self, key: SourceKey | None, raw: dict[str, Any]) -> int | None:
+    def _schedule_retry(
+        self, key: SourceKey | None, raw: dict[str, Any], alert_id: str
+    ) -> int | None:
         """Queue another attempt.
 
         Returns None when a retry is scheduled, or the attempt count when the
@@ -242,7 +290,7 @@ class PollingWorker:
             # No stable source ID to retry against, so this was the only try.
             return 1
 
-        pending = self._retries.get(key) or _PendingRetry(raw=raw)
+        pending = self._retries.get(key) or _PendingRetry(raw=raw, alert_id=alert_id)
         pending.attempts += 1
         pending.raw = raw
 
@@ -272,7 +320,12 @@ class PollingWorker:
     async def _dead_letter_evicted(
         self, key: SourceKey, pending: _PendingRetry, summary: PollSummary
     ) -> None:
-        alert = self.connector.normalize(pending.raw)
+        try:
+            alert = self.connector.normalize(pending.raw)
+        except Exception:
+            logger.exception("Evicted retry %s no longer normalizes; dropping it", "/".join(key))
+            return
+        alert = alert.model_copy(update={"id": pending.alert_id})
         if not alert.source_id:
             return  # cannot have been queued without one
 
@@ -307,6 +360,10 @@ class PollingWorker:
     def _clear_retry(self, key: SourceKey | None) -> None:
         if key is not None:
             self._retries.pop(key, None)
+
+    def _retry_key_from_raw(self, pending: _PendingRetry) -> SourceKey | None:
+        source_id = self.connector.identify(pending.raw)
+        return (self.connector.name, source_id) if source_id else None
 
     @staticmethod
     def _retry_key(alert: Alert) -> SourceKey | None:
