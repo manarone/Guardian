@@ -182,10 +182,24 @@ def _map_severity(info: dict[str, Any]) -> Severity:
     return Severity.MEDIUM
 
 
+# SentinelOne's `fileVerificationType` enum. Anything else is reported as
+# unknown rather than unsigned, so an enum value we have not seen cannot be
+# read by the analyst as evidence either way.
+_SIGNED_BY_VERIFICATION = {
+    "signedverified": True,
+    "signed": True,
+    "notsigned": False,
+    "unsigned": False,
+}
+
+
 def _map_signed(verification_type: Any) -> bool | None:
     if not verification_type:
         return None
-    return str(verification_type).lower() == "signed"
+    signed = _SIGNED_BY_VERIFICATION.get(str(verification_type).lower())
+    if signed is None:
+        logger.debug("Unmapped SentinelOne fileVerificationType: %r", verification_type)
+    return signed
 
 
 def _extract_techniques(indicators: list[dict[str, Any]]) -> list[str]:

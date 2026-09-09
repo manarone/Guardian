@@ -12,7 +12,7 @@ from typing import Any
 from guardian.agent.analyst import Analyst
 from guardian.connectors.base import Connector
 from guardian.models import Alert, TriageResult
-from guardian.store import TERMINAL_STATUSES, InMemoryStore
+from guardian.store import TERMINAL_STATUSES, InMemoryStore, SourceKey
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ class PollingWorker:
         # Serializes the scheduled loop against manual POST /v1/poll calls, so
         # two cycles cannot both see the same alert as unseen and triage it twice.
         self._poll_lock = asyncio.Lock()
-        self._retries: OrderedDict[str, _PendingRetry] = OrderedDict()
+        self._retries: OrderedDict[SourceKey, _PendingRetry] = OrderedDict()
 
     def start(self) -> None:
         if self._task is None:
@@ -200,7 +200,7 @@ class PollingWorker:
             await self._triage_and_record(alert, raw, key, summary)
 
     async def _triage_and_record(
-        self, alert: Alert, raw: dict[str, Any], key: str | None, summary: PollSummary
+        self, alert: Alert, raw: dict[str, Any], key: SourceKey | None, summary: PollSummary
     ) -> None:
         summary.attempts += 1
         result = await self.analyst.triage(alert)
@@ -232,7 +232,7 @@ class PollingWorker:
         now = datetime.now(UTC)
         return [p.raw for p in list(self._retries.values()) if p.next_attempt <= now]
 
-    def _schedule_retry(self, key: str | None, raw: dict[str, Any]) -> int | None:
+    def _schedule_retry(self, key: SourceKey | None, raw: dict[str, Any]) -> int | None:
         """Queue another attempt.
 
         Returns None when a retry is scheduled, or the attempt count when the
@@ -250,7 +250,7 @@ class PollingWorker:
             self._retries.pop(key, None)
             logger.error(
                 "Dead-lettering %s after %d failed triage attempts; needs a human",
-                key,
+                "/".join(key),
                 pending.attempts,
             )
             return pending.attempts
@@ -261,16 +261,16 @@ class PollingWorker:
         self._retries.move_to_end(key)
         return None
 
-    def _evict_overflow(self) -> list[tuple[str, _PendingRetry]]:
-        evicted: list[tuple[str, _PendingRetry]] = []
+    def _evict_overflow(self) -> list[tuple[SourceKey, _PendingRetry]]:
+        evicted: list[tuple[SourceKey, _PendingRetry]] = []
         while len(self._retries) > MAX_PENDING_RETRIES:
             key, pending = self._retries.popitem(last=False)
-            logger.error("Retry queue full; dead-lettering %s without a verdict", key)
+            logger.error("Retry queue full; dead-lettering %s without a verdict", "/".join(key))
             evicted.append((key, pending))
         return evicted
 
     async def _dead_letter_evicted(
-        self, key: str, pending: _PendingRetry, summary: PollSummary
+        self, key: SourceKey, pending: _PendingRetry, summary: PollSummary
     ) -> None:
         alert = self.connector.normalize(pending.raw)
         if not alert.source_id:
@@ -304,12 +304,12 @@ class PollingWorker:
             update={"status": "dead_lettered", "error": f"{error}dead-lettered {reason}"}
         )
 
-    def _clear_retry(self, key: str | None) -> None:
+    def _clear_retry(self, key: SourceKey | None) -> None:
         if key is not None:
             self._retries.pop(key, None)
 
     @staticmethod
-    def _retry_key(alert: Alert) -> str | None:
+    def _retry_key(alert: Alert) -> SourceKey | None:
         if not alert.source_id:
             return None
-        return f"{alert.source}:{alert.source_id}"
+        return (alert.source, alert.source_id)

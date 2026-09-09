@@ -116,3 +116,19 @@ def test_malformed_created_at_leaves_the_cursor_unset():
     )
 
     assert alert.cursor_at is None
+
+
+def test_signed_verified_maps_to_signed():
+    """SentinelOne's enum is SignedVerified/NotSigned, not "signed"; telling
+    the analyst a verified binary is unsigned is wrong evidence."""
+    alert = normalize_threat(
+        {"id": "1", "threatInfo": {"threatName": "x", "fileVerificationType": "SignedVerified"}}
+    )
+    assert alert.process.signed is True
+
+
+def test_unknown_verification_type_is_unknown_not_unsigned():
+    alert = normalize_threat(
+        {"id": "1", "threatInfo": {"threatName": "x", "fileVerificationType": "SignedInvalid"}}
+    )
+    assert alert.process.signed is None

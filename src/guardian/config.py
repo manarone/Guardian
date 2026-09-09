@@ -25,7 +25,9 @@ class Settings(BaseSettings):
     # SentinelOne
     s1_base_url: str = ""
     s1_api_token: str = ""
-    s1_poll_interval: int = 60
+    # Zero or negative would poll in a tight loop and retry failures with no
+    # backoff, burning both the SentinelOne and model quotas.
+    s1_poll_interval: int = Field(default=60, ge=1)
     s1_poll_enabled: bool = True
     s1_page_limit: int = 100
 

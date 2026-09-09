@@ -161,7 +161,7 @@ async def test_cursor_advances_past_failures_while_they_stay_queued():
 
     # Cursor moved to the newest alert, and the failure is queued instead.
     assert worker._since == later
-    assert "sentinelone:fails" in worker._retries
+    assert ("sentinelone", "fails") in worker._retries
 
     await worker.poll_once()
     assert connector.since_calls[1] == later
@@ -179,7 +179,7 @@ async def test_retry_backoff_defers_the_next_attempt():
 
     # Backoff has not elapsed, so no second attempt was made.
     assert analyst.calls == ["a"]
-    assert worker._retries["sentinelone:a"].attempts == 1
+    assert worker._retries[("sentinelone", "a")].attempts == 1
 
 
 async def test_persistent_failure_is_dead_lettered():
@@ -274,7 +274,7 @@ async def test_retry_queue_overflow_is_dead_lettered(monkeypatch):
     assert evicted.alert.id not in summary.failed
     assert summary.processed == 3
     assert await store.has_seen("sentinelone", "f0")
-    assert list(worker._retries) == ["sentinelone:f1", "sentinelone:f2"]
+    assert list(worker._retries) == [("sentinelone", "f1"), ("sentinelone", "f2")]
 
 
 async def test_worker_skips_an_alert_the_webhook_finished_under_the_lock():
@@ -360,7 +360,7 @@ async def test_eviction_does_not_overwrite_a_verdict_the_webhook_produced(monkey
     stored = await store.get_by_source("sentinelone", "a")
     assert stored is not None and stored.status == "triaged"
     assert summary.dead_lettered == []
-    assert "sentinelone:a" not in worker._retries
+    assert ("sentinelone", "a") not in worker._retries
 
 
 async def test_processed_counts_model_calls_not_evictions(monkeypatch):

@@ -234,3 +234,9 @@ def test_explicit_dev_opt_out_allows_unauthenticated_writes():
         response = client.post("/v1/alerts", json={"source": "manual", "title": "x"})
 
     assert response.status_code == 201
+
+
+def test_nonpositive_poll_interval_is_rejected():
+    """Zero would poll in a tight loop and retry failures with no backoff."""
+    with pytest.raises(ValueError, match="s1_poll_interval"):
+        Settings(webhook_token="t", s1_poll_interval=0, _env_file=None)

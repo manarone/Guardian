@@ -79,3 +79,15 @@ async def test_reused_alert_id_does_not_leave_a_stale_source_mapping():
     assert await store.has_seen("m", "one") is False
     assert await store.get_by_source("m", "one") is None
     assert await store.has_seen("m", "two") is True
+
+
+async def test_source_keys_do_not_collide_on_the_separator():
+    """Both parts are caller-controlled; ("a:b", "c") and ("a", "b:c") are
+    different alerts and must not share a dedupe record."""
+    store = InMemoryStore()
+    first = Alert(source="a:b", source_id="c", title="first")
+    await store.put(TriageResult(alert=first, status="triaged"))
+
+    assert await store.has_seen("a:b", "c") is True
+    assert await store.has_seen("a", "b:c") is False
+    assert await store.get_by_source("a", "b:c") is None

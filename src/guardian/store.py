@@ -21,6 +21,9 @@ from guardian.models import TriageResult
 # ceiling is hit, a redelivery must not restart the whole sequence.
 TERMINAL_STATUSES = frozenset({"triaged", "refused", "dead_lettered"})
 
+# (source, source_id) identifying one alert as the vendor knows it.
+SourceKey = tuple[str, str]
+
 
 class InMemoryStore:
     """Bounded, newest-first store of triage results."""
@@ -28,13 +31,13 @@ class InMemoryStore:
     def __init__(self, max_items: int = 1000) -> None:
         self._items: OrderedDict[str, TriageResult] = OrderedDict()
         # Source alert key -> the alert ID of the latest attempt at it.
-        self._by_source: dict[str, str] = {}
+        self._by_source: dict[SourceKey, str] = {}
         self._max_items = max_items
         self._lock = asyncio.Lock()
         # One lock per in-flight source alert, created on demand and dropped
         # when the last holder leaves, so the table never outgrows the work.
-        self._source_locks: dict[str, asyncio.Lock] = {}
-        self._source_lock_holders: dict[str, int] = {}
+        self._source_locks: dict[SourceKey, asyncio.Lock] = {}
+        self._source_lock_holders: dict[SourceKey, int] = {}
 
     async def put(self, result: TriageResult) -> None:
         """Store a result, superseding any earlier attempt at the same alert."""
@@ -143,11 +146,13 @@ class InMemoryStore:
             return result is not None and result.status in TERMINAL_STATUSES
 
     @staticmethod
-    def _key(source: str, source_id: str) -> str:
-        return f"{source}:{source_id}"
+    def _key(source: str, source_id: str) -> SourceKey:
+        # A tuple, not a joined string: both parts are caller-controlled, so
+        # ("a:b", "c") and ("a", "b:c") must stay distinct alerts.
+        return (source, source_id)
 
     @classmethod
-    def _source_key(cls, result: TriageResult) -> str | None:
+    def _source_key(cls, result: TriageResult) -> SourceKey | None:
         if not result.alert.source_id:
             return None
         return cls._key(result.alert.source, result.alert.source_id)
