@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def _utcnow() -> datetime:
@@ -97,6 +97,20 @@ class Alert(BaseModel):
 
     vendor_status: str | None = Field(default=None, description="e.g. mitigated, blocked, detected")
     raw: dict[str, Any] = Field(default_factory=dict, description="Original vendor payload")
+
+    @field_validator("observed_at", "received_at", "cursor_at")
+    @classmethod
+    def _ensure_timezone_aware(cls, value: datetime | None) -> datetime | None:
+        """Treat a naive timestamp as UTC.
+
+        An ISO string posted to /v1/alerts without an offset parses naive, and
+        comparing that against an aware cutoff raises TypeError - which would
+        surface as a failed triage rather than a validation error. Normalizing
+        at the schema boundary keeps every downstream comparison safe.
+        """
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
 
     def summary(self) -> str:
         """Compact human/model-readable rendering used in the triage prompt."""

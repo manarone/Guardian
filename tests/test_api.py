@@ -50,6 +50,39 @@ def test_healthz_reports_configuration(client):
     assert body["sentinelone_configured"] is False
 
 
+def test_healthz_counts_only_verdicts_as_triaged(client):
+    """A refusal or failure must not read as completed triage work."""
+    store = client.app.state.store
+
+    async def seed():
+        for title, status in [("ok", "triaged"), ("bad", "failed"), ("no", "refused")]:
+            await store.put(TriageResult(alert=Alert(source="m", title=title), status=status))
+
+    # The store is async and the TestClient is sync; go through its portal.
+    client.portal.call(seed)
+
+    body = client.get("/healthz").json()
+    assert body["stored_count"] == 3
+    assert body["triaged_count"] == 1
+    assert body["failed_count"] == 1
+    assert body["refused_count"] == 1
+
+
+def test_naive_timestamps_are_accepted_and_normalized(client):
+    """An ISO timestamp without an offset must not poison later comparisons."""
+    alert = {
+        "source": "manual",
+        "title": "Naive timestamp",
+        "observed_at": "2026-09-09T12:00:00",
+    }
+
+    response = client.post("/v1/alerts", json=alert, headers={"X-Guardian-Token": "s3cret"})
+    assert response.status_code == 201
+
+    observed = response.json()["result"]["alert"]["observed_at"]
+    assert observed.endswith(("+00:00", "Z"))
+
+
 def test_ingest_triages_and_stores_an_alert(client):
     alert = {"source": "manual", "title": "Suspicious PowerShell", "severity": "high"}
 

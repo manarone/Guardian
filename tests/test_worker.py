@@ -49,12 +49,13 @@ class FakeAnalyst:
         return TriageResult(alert=alert, status=self.status)
 
 
-def _worker(connector, analyst, store=None):
+def _worker(connector, analyst, store=None, interval=3600):
+    # interval=0 makes retry backoff zero, so a queued retry is due immediately.
     return PollingWorker(
         connector=connector,
         analyst=analyst,
         store=store or InMemoryStore(),
-        interval=3600,
+        interval=interval,
         lookback=timedelta(hours=1),
     )
 
@@ -73,23 +74,24 @@ async def test_cursor_advances_on_cursor_at_not_observed_at():
     assert connector.since_calls[1] == created
 
 
-async def test_failed_triage_is_retried_on_the_next_poll():
-    """A transient API failure must not permanently skip the alert."""
+async def test_failed_triage_is_retried_from_the_queue():
+    """A transient failure is retried from the queue, not by refetching."""
     payload = {"id": "a", "observed_at": datetime.now(UTC)}
-    connector = FakeConnector([[payload], [payload]])
+    # Second batch is empty: the retry must come from the queue, not the source.
+    connector = FakeConnector([[payload], []])
     store = InMemoryStore()
 
     failing = FakeAnalyst(status="failed")
-    worker = _worker(connector, failing, store)
+    worker = _worker(connector, failing, store, interval=0)
     await worker.poll_once()
     assert failing.calls == ["a"]
 
-    # Same alert comes back on the next poll; this time triage succeeds.
     worker.analyst = succeeding = FakeAnalyst(status="triaged")
     await worker.poll_once()
 
     assert succeeding.calls == ["a"]
     assert await store.has_seen("sentinelone", "a")
+    assert worker._retries == {}
 
 
 async def test_terminal_result_is_not_retriaged():
@@ -137,12 +139,13 @@ async def test_cursor_is_not_committed_when_the_batch_raises():
     assert worker._since == original_since
 
 
-async def test_cursor_does_not_advance_past_a_failed_alert():
-    """A later success must not strand an earlier failure beyond the watermark."""
+async def test_cursor_advances_past_failures_while_they_stay_queued():
+    """A failure must not pin the cursor - that refetches history every cycle."""
     base = datetime.now(UTC) - timedelta(minutes=10)
+    later = base + timedelta(seconds=30)
     batch = [
         {"id": "fails", "observed_at": base, "cursor_at": base},
-        {"id": "works", "observed_at": base, "cursor_at": base + timedelta(seconds=30)},
+        {"id": "works", "observed_at": base, "cursor_at": later},
     ]
 
     class Selective(FakeAnalyst):
@@ -152,13 +155,58 @@ async def test_cursor_does_not_advance_past_a_failed_alert():
             return TriageResult(alert=alert, status=status)
 
     connector = FakeConnector([batch, []])
-    worker = _worker(connector, Selective())
+    worker = _worker(connector, Selective(), interval=0)
+
+    await worker.poll_once()
+
+    # Cursor moved to the newest alert, and the failure is queued instead.
+    assert worker._since == later
+    assert "sentinelone:fails" in worker._retries
+
+    await worker.poll_once()
+    assert connector.since_calls[1] == later
+
+
+async def test_retry_backoff_defers_the_next_attempt():
+    """Retries must not fire every cycle during an outage."""
+    payload = {"id": "a", "observed_at": datetime.now(UTC)}
+    connector = FakeConnector([[payload], []])
+    analyst = FakeAnalyst(status="failed")
+    worker = _worker(connector, analyst, interval=3600)
 
     await worker.poll_once()
     await worker.poll_once()
 
-    # Watermark held at the failed alert's cursor, not the later success's.
-    assert connector.since_calls[1] == base
+    # Backoff has not elapsed, so no second attempt was made.
+    assert analyst.calls == ["a"]
+    assert worker._retries["sentinelone:a"].attempts == 1
+
+
+async def test_persistent_failure_is_dead_lettered():
+    """A deterministically failing alert must stop consuming API calls."""
+    payload = {"id": "a", "observed_at": datetime.now(UTC)}
+    connector = FakeConnector([[payload]] + [[] for _ in range(10)])
+    analyst = FakeAnalyst(status="failed")
+    worker = _worker(connector, analyst, interval=0)
+
+    summaries = [await worker.poll_once() for _ in range(6)]
+
+    assert len(analyst.calls) == 5  # MAX_RETRY_ATTEMPTS
+    assert worker._retries == {}
+    assert any(s.dead_lettered for s in summaries)
+
+
+async def test_a_queued_alert_is_not_triaged_twice_when_refetched():
+    """The retry queue owns a failed alert; a refetch must not duplicate it."""
+    payload = {"id": "a", "observed_at": datetime.now(UTC)}
+    connector = FakeConnector([[payload], [payload]])
+    analyst = FakeAnalyst(status="failed")
+    worker = _worker(connector, analyst, interval=3600)
+
+    await worker.poll_once()
+    await worker.poll_once()
+
+    assert analyst.calls == ["a"]
 
 
 async def test_summary_separates_failed_and_refused_from_triaged():

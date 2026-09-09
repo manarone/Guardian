@@ -29,7 +29,11 @@ class HealthResponse(BaseModel):
     model: str
     sentinelone_configured: bool
     polling: bool
+    # Split so a refusal spike or model outage cannot read as successful work.
+    stored_count: int
     triaged_count: int
+    failed_count: int
+    refused_count: int
 
 
 class IngestResponse(BaseModel):
@@ -68,7 +72,10 @@ async def healthz(request: Request) -> HealthResponse:
         model=state.settings.model,
         sentinelone_configured=state.settings.sentinelone_configured,
         polling=state.worker is not None,
-        triaged_count=len(results),
+        stored_count=len(results),
+        triaged_count=sum(1 for r in results if r.status == "triaged"),
+        failed_count=sum(1 for r in results if r.status == "failed"),
+        refused_count=sum(1 for r in results if r.status == "refused"),
     )
 
 

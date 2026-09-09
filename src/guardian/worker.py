@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from guardian.agent.analyst import Analyst
 from guardian.connectors.base import Connector
+from guardian.models import Alert
 from guardian.store import InMemoryStore
 
 logger = logging.getLogger(__name__)
+
+# A failed alert is retried with exponential backoff up to this many times, then
+# dead-lettered. Without a ceiling, a deterministically failing alert would be
+# resent to the model on every cycle forever.
+MAX_RETRY_ATTEMPTS = 5
+MAX_RETRY_BACKOFF = timedelta(hours=1)
+MAX_PENDING_RETRIES = 200
 
 
 @dataclass
@@ -25,10 +35,20 @@ class PollSummary:
     triaged: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)
+    dead_lettered: list[str] = field(default_factory=list)
 
     @property
     def processed(self) -> int:
         return len(self.triaged) + len(self.failed) + len(self.refused)
+
+
+@dataclass
+class _PendingRetry:
+    """A failed alert awaiting another attempt."""
+
+    raw: dict[str, Any]
+    attempts: int = 0
+    next_attempt: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class PollingWorker:
@@ -36,6 +56,11 @@ class PollingWorker:
 
     The high-water mark starts one lookback window in the past so a fresh start
     picks up recent alerts rather than only those arriving from now on.
+
+    Failures are tracked in an explicit retry queue rather than by holding the
+    cursor back. Holding the cursor would make one deterministically failing
+    alert refetch the entire history behind it on every cycle; a queue retries
+    just the alert that failed, with backoff and a ceiling.
     """
 
     def __init__(
@@ -55,6 +80,7 @@ class PollingWorker:
         # Serializes the scheduled loop against manual POST /v1/poll calls, so
         # two cycles cannot both see the same alert as unseen and triage it twice.
         self._poll_lock = asyncio.Lock()
+        self._retries: OrderedDict[str, _PendingRetry] = OrderedDict()
 
     def start(self) -> None:
         if self._task is None:
@@ -90,7 +116,7 @@ class PollingWorker:
             await asyncio.sleep(self.interval)
 
     async def poll_once(self) -> PollSummary:
-        """Fetch, deduplicate, and triage one batch.
+        """Retry due failures, then fetch and triage anything new.
 
         Serialized against concurrent callers - the scheduled loop and a manual
         `POST /v1/poll` would otherwise race on the dedupe check.
@@ -99,12 +125,14 @@ class PollingWorker:
             return await self._poll_once_locked()
 
     async def _poll_once_locked(self) -> PollSummary:
-        raw_alerts = await self.connector.fetch_since(self._since)
         summary = PollSummary()
+
+        # Retries first, so a backlog drains even while new alerts keep arriving.
+        for raw in self._due_retries():
+            await self._triage_one(raw, summary)
+
+        raw_alerts = await self.connector.fetch_since(self._since)
         batch_cursor = self._since
-        # Earliest cursor among alerts that failed this cycle. The watermark must
-        # not move past it, or the inclusive refetch can never reach them again.
-        retry_floor: datetime | None = None
 
         for raw in raw_alerts:
             alert = self.connector.normalize(raw)
@@ -112,33 +140,93 @@ class PollingWorker:
             cursor = alert.cursor_at or alert.observed_at
             batch_cursor = max(batch_cursor, cursor)
 
+            key = self._retry_key(alert)
+            if key is not None and key in self._retries:
+                continue  # already queued; the retry path owns it
             if alert.source_id and await self.store.has_seen(alert.source, alert.source_id):
                 continue
 
-            result = await self.analyst.triage(alert)
-            await self.store.put(result)
+            await self._triage_one(raw, summary, alert=alert)
 
-            if result.status == "triaged":
-                summary.triaged.append(alert.id)
-            elif result.status == "refused":
-                # Terminal: a refusal needs a human, and retrying only burns tokens.
-                summary.refused.append(alert.id)
-            else:
-                summary.failed.append(alert.id)
-                retry_floor = cursor if retry_floor is None else min(retry_floor, cursor)
+        # Commit the watermark once, after the batch. If this cycle raises
+        # partway, `_since` is untouched and the next cycle refetches; dedupe
+        # drops whatever already landed. The cursor advances past failures
+        # because the retry queue, not the watermark, is what brings them back.
+        self._since = batch_cursor
 
-        # Commit the high-water mark once, after the batch. If this cycle raises
-        # partway, `_since` is untouched and the next cycle refetches the batch;
-        # dedupe drops whatever already landed. A failed alert holds the
-        # watermark at its own cursor so the next cycle can still reach it.
-        self._since = retry_floor if retry_floor is not None else batch_cursor
-
-        if summary.processed:
+        if summary.processed or summary.dead_lettered:
             logger.info(
-                "%s poll: %d triaged, %d failed, %d refused",
+                "%s poll: %d triaged, %d failed, %d refused, %d dead-lettered (%d awaiting retry)",
                 self.connector.name,
                 len(summary.triaged),
                 len(summary.failed),
                 len(summary.refused),
+                len(summary.dead_lettered),
+                len(self._retries),
             )
         return summary
+
+    async def _triage_one(
+        self, raw: dict[str, Any], summary: PollSummary, alert: Alert | None = None
+    ) -> None:
+        """Triage one payload and record the outcome, scheduling a retry if needed."""
+        alert = alert if alert is not None else self.connector.normalize(raw)
+        key = self._retry_key(alert)
+
+        result = await self.analyst.triage(alert)
+        await self.store.put(result)
+
+        if result.status == "triaged":
+            summary.triaged.append(alert.id)
+            self._clear_retry(key)
+        elif result.status == "refused":
+            # Terminal: a refusal needs a human, and retrying only burns tokens.
+            summary.refused.append(alert.id)
+            self._clear_retry(key)
+        else:
+            summary.failed.append(alert.id)
+            if not self._schedule_retry(key, raw):
+                summary.dead_lettered.append(alert.id)
+
+    def _due_retries(self) -> list[dict[str, Any]]:
+        now = datetime.now(UTC)
+        return [p.raw for p in list(self._retries.values()) if p.next_attempt <= now]
+
+    def _schedule_retry(self, key: str | None, raw: dict[str, Any]) -> bool:
+        """Queue another attempt. Returns False when the alert is dead-lettered."""
+        if key is None:
+            # No stable source ID to retry against; the failed result is stored.
+            return False
+
+        pending = self._retries.get(key) or _PendingRetry(raw=raw)
+        pending.attempts += 1
+        pending.raw = raw
+
+        if pending.attempts >= MAX_RETRY_ATTEMPTS:
+            self._retries.pop(key, None)
+            logger.error(
+                "Dead-lettering %s after %d failed triage attempts; needs a human",
+                key,
+                pending.attempts,
+            )
+            return False
+
+        backoff = min(timedelta(seconds=self.interval * (2**pending.attempts)), MAX_RETRY_BACKOFF)
+        pending.next_attempt = datetime.now(UTC) + backoff
+        self._retries[key] = pending
+        self._retries.move_to_end(key)
+
+        while len(self._retries) > MAX_PENDING_RETRIES:
+            dropped, _ = self._retries.popitem(last=False)
+            logger.error("Retry queue full; dropping %s without a verdict", dropped)
+        return True
+
+    def _clear_retry(self, key: str | None) -> None:
+        if key is not None:
+            self._retries.pop(key, None)
+
+    @staticmethod
+    def _retry_key(alert: Alert) -> str | None:
+        if not alert.source_id:
+            return None
+        return f"{alert.source}:{alert.source_id}"
