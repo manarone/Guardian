@@ -1,0 +1,104 @@
+"""API tests. The analyst is stubbed - these never call the Claude API."""
+
+import pytest
+from fastapi.testclient import TestClient
+
+from guardian.api.app import create_app
+from guardian.config import Settings
+from guardian.models import Alert, Disposition, Severity, TriageResult, Verdict
+
+
+class StubAnalyst:
+    """Stands in for `Analyst`, returning a fixed verdict."""
+
+    def __init__(self):
+        self.calls: list[Alert] = []
+
+    async def triage(self, alert: Alert) -> TriageResult:
+        self.calls.append(alert)
+        return TriageResult(
+            alert=alert,
+            status="triaged",
+            model="stub",
+            verdict=Verdict(
+                disposition=Disposition.TRUE_POSITIVE,
+                confidence=0.9,
+                severity=Severity.HIGH,
+                title="Credential dumping on WIN-FIN-0427",
+                summary="Mimikatz was executed against LSASS.",
+                reasoning="Command line contains sekurlsa::logonpasswords.",
+                recommended_actions=["Isolate WIN-FIN-0427"],
+                escalate=True,
+            ),
+        )
+
+
+@pytest.fixture
+def client():
+    settings = Settings(s1_poll_enabled=False, webhook_token="s3cret", _env_file=None)
+    app = create_app(settings)
+    with TestClient(app) as test_client:
+        test_client.app.state.analyst = StubAnalyst()
+        yield test_client
+
+
+def test_healthz_reports_configuration(client):
+    body = client.get("/healthz").json()
+
+    assert body["status"] == "ok"
+    assert body["polling"] is False
+    assert body["sentinelone_configured"] is False
+
+
+def test_ingest_triages_and_stores_an_alert(client):
+    alert = {"source": "manual", "title": "Suspicious PowerShell", "severity": "high"}
+
+    response = client.post("/v1/alerts", json=alert, headers={"X-Guardian-Token": "s3cret"})
+    assert response.status_code == 201
+
+    body = response.json()
+    assert body["result"]["status"] == "triaged"
+    assert body["result"]["verdict"]["disposition"] == "true_positive"
+
+    stored = client.get(f"/v1/triage/{body['alert_id']}")
+    assert stored.status_code == 200
+    assert stored.json()["alert"]["title"] == "Suspicious PowerShell"
+
+
+def test_ingest_rejects_a_bad_token(client):
+    response = client.post(
+        "/v1/alerts", json={"source": "manual", "title": "x"}, headers={"X-Guardian-Token": "wrong"}
+    )
+    assert response.status_code == 401
+
+
+def test_ingest_rejects_a_missing_token(client):
+    response = client.post("/v1/alerts", json={"source": "manual", "title": "x"})
+    assert response.status_code == 401
+
+
+def test_sentinelone_webhook_normalizes_before_triage(client):
+    payload = {
+        "id": "99",
+        "threatInfo": {"threatName": "evil.exe", "confidenceLevel": "malicious"},
+        "agentRealtimeInfo": {"agentComputerName": "WIN-1"},
+    }
+
+    response = client.post(
+        "/v1/alerts/sentinelone", json=payload, headers={"X-Guardian-Token": "s3cret"}
+    )
+    assert response.status_code == 201
+
+    alert = response.json()["result"]["alert"]
+    assert alert["source"] == "sentinelone"
+    assert alert["title"] == "evil.exe"
+    assert alert["host"]["hostname"] == "WIN-1"
+
+
+def test_unknown_alert_id_is_404(client):
+    assert client.get("/v1/triage/does-not-exist").status_code == 404
+
+
+def test_poll_without_a_connector_is_503(client):
+    response = client.post("/v1/poll", headers={"X-Guardian-Token": "s3cret"})
+    assert response.status_code == 503

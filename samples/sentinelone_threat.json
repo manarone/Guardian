@@ -1,0 +1,43 @@
+{
+  "id": "1878234567890123456",
+  "threatInfo": {
+    "threatName": "mimikatz.exe",
+    "classification": "Malware",
+    "classificationSource": "Static",
+    "confidenceLevel": "malicious",
+    "detectionType": "static",
+    "engines": ["On-Write Static AI - Suspicious"],
+    "filePath": "C:\\Users\\jdoe\\Downloads\\mimikatz.exe",
+    "sha256": "912018ab3c6b16b39ee84f17745ff0c80a33cee241013ec35d0281e40c0658d9",
+    "fileVerificationType": "NotSigned",
+    "maliciousProcessArguments": "mimikatz.exe \"privilege::debug\" \"sekurlsa::logonpasswords\"",
+    "originatorProcess": "explorer.exe",
+    "parentProcessName": "explorer.exe",
+    "processUser": "CORP\\jdoe",
+    "identifiedAt": "2026-09-08T14:22:31.000000Z",
+    "createdAt": "2026-09-08T14:22:35.000000Z",
+    "mitigationStatus": "mitigated",
+    "analystVerdict": "undefined",
+    "initiatedByDescription": "Agent Policy",
+    "storyline": "B1A2C3D4E5F60718"
+  },
+  "agentRealtimeInfo": {
+    "agentComputerName": "WIN-FIN-0427",
+    "agentId": "1234567890123456789",
+    "agentIpV4": "10.20.30.41",
+    "agentOsName": "Windows 11 Pro",
+    "agentDomain": "CORP",
+    "agentVersion": "23.4.2.350"
+  },
+  "indicators": [
+    {
+      "category": "Credential Access",
+      "tactics": [
+        {
+          "name": "Credential Access",
+          "techniques": [{"name": "T1003.001 - LSASS Memory"}]
+        }
+      ]
+    }
+  ]
+}
