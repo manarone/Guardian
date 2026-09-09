@@ -12,12 +12,14 @@ from __future__ import annotations
 import hmac
 import logging
 from typing import Annotated, Any
+from uuid import uuid4
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel
 
 from guardian.connectors.sentinelone import normalize_threat
 from guardian.models import Alert, TriageResult
+from guardian.store import TERMINAL_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -58,22 +60,26 @@ def _authorize(request: Request, token: str | None) -> None:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Server misconfigured: no webhook token is set",
         )
-    # Starlette decodes header values as latin-1, so a non-ASCII token arrives
-    # as a str that `compare_digest` refuses to compare. Bytes always compare.
-    if not token or not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+    # Starlette decodes header values as latin-1, so re-encoding as latin-1
+    # recovers the exact bytes the client sent; those are compared against the
+    # configured secret's UTF-8 bytes. Encoding the decoded str as UTF-8 instead
+    # would mangle any non-ASCII token so it could never authenticate.
+    if not token or not hmac.compare_digest(token.encode("latin-1"), expected.encode("utf-8")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing X-Guardian-Token"
         )
 
 
-async def _triage_deduped(request: Request, alert: Alert) -> IngestResponse:
+async def _triage_deduped(request: Request, response: Response, alert: Alert) -> IngestResponse:
     """Triage an alert once per source ID, whichever endpoint delivered it.
 
     Redelivery is common - vendors retry webhooks, and one can race the poller -
-    so an already-finished source alert returns its existing result rather than
-    paying for a second model call and orphaning the first alert ID. The check,
-    the model call, and the write run under one per-alert lock so two
-    deliveries arriving together cannot both pass the check.
+    so an already-finished source alert returns its existing result (as a 200,
+    since nothing was created) rather than paying for a second model call and
+    orphaning the first alert ID. A source alert whose earlier attempt failed
+    is retried under that attempt's ID, so one alert keeps one ID across the
+    poller and the webhook. The check, the model call, and the write run under
+    one per-alert lock so two deliveries arriving together cannot both pass.
     """
     store = request.app.state.store
     analyst = request.app.state.analyst
@@ -85,11 +91,13 @@ async def _triage_deduped(request: Request, alert: Alert) -> IngestResponse:
         return IngestResponse(alert_id=alert.id, result=result)
 
     async with store.lock_source(alert.source, alert.source_id):
-        if await store.has_seen(alert.source, alert.source_id):
-            existing = await store.get_by_source(alert.source, alert.source_id)
-            if existing is not None:
+        existing = await store.get_by_source(alert.source, alert.source_id)
+        if existing is not None:
+            if existing.status in TERMINAL_STATUSES:
                 logger.info("Returning existing triage for %s:%s", alert.source, alert.source_id)
+                response.status_code = status.HTTP_200_OK
                 return IngestResponse(alert_id=existing.alert.id, result=existing)
+            alert = alert.model_copy(update={"id": existing.alert.id})
 
         result = await analyst.triage(alert)
         await store.put(result)
@@ -99,23 +107,24 @@ async def _triage_deduped(request: Request, alert: Alert) -> IngestResponse:
 @router.get("/healthz", response_model=HealthResponse)
 async def healthz(request: Request) -> HealthResponse:
     state = request.app.state
-    results = await state.store.list(limit=1000)
+    counts = await state.store.status_counts()
     return HealthResponse(
         status="ok",
         model=state.settings.model,
         sentinelone_configured=state.settings.sentinelone_configured,
         polling=state.worker is not None,
-        stored_count=len(results),
-        triaged_count=sum(1 for r in results if r.status == "triaged"),
-        failed_count=sum(1 for r in results if r.status == "failed"),
-        refused_count=sum(1 for r in results if r.status == "refused"),
-        dead_lettered_count=sum(1 for r in results if r.status == "dead_lettered"),
+        stored_count=sum(counts.values()),
+        triaged_count=counts.get("triaged", 0),
+        failed_count=counts.get("failed", 0),
+        refused_count=counts.get("refused", 0),
+        dead_lettered_count=counts.get("dead_lettered", 0),
     )
 
 
 @router.post("/v1/alerts", response_model=IngestResponse, status_code=status.HTTP_201_CREATED)
 async def ingest_alert(
     request: Request,
+    response: Response,
     alert: Alert,
     x_guardian_token: Annotated[str | None, Header()] = None,
 ) -> IngestResponse:
@@ -126,7 +135,10 @@ async def ingest_alert(
     `source_id` when one is supplied, exactly like the vendor endpoints.
     """
     _authorize(request, x_guardian_token)
-    return await _triage_deduped(request, alert)
+    # Guardian IDs are minted here, never taken from the caller: a supplied ID
+    # matching an existing record would replace that record outright.
+    alert = alert.model_copy(update={"id": str(uuid4())})
+    return await _triage_deduped(request, response, alert)
 
 
 @router.post(
@@ -134,18 +146,32 @@ async def ingest_alert(
 )
 async def ingest_sentinelone_alert(
     request: Request,
+    response: Response,
     payload: dict[str, Any],
     x_guardian_token: Annotated[str | None, Header()] = None,
 ) -> IngestResponse:
-    """Triage a raw SentinelOne threat object, normalizing it on the way in."""
+    """Triage a raw SentinelOne threat object, normalizing it on the way in.
+
+    A payload the mapper cannot handle is the caller's problem, so it is
+    reported as 422 rather than surfacing as a 500 that a vendor would keep
+    retrying.
+    """
     _authorize(request, x_guardian_token)
-    return await _triage_deduped(request, normalize_threat(payload))
+    try:
+        alert = normalize_threat(payload)
+    except Exception as exc:
+        logger.warning("Rejecting unparseable SentinelOne payload: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Payload is not a SentinelOne threat object: {type(exc).__name__}: {exc}",
+        ) from exc
+    return await _triage_deduped(request, response, alert)
 
 
 @router.get("/v1/triage", response_model=list[TriageResult])
 async def list_triage(
     request: Request,
-    limit: int = 50,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 50,
     x_guardian_token: Annotated[str | None, Header()] = None,
 ) -> list[TriageResult]:
     """List recent results. Authenticated: results carry the raw vendor payload."""

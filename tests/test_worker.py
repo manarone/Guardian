@@ -16,13 +16,14 @@ class FakeConnector:
     def __init__(self, batches: list[list[dict]]):
         self._batches = list(batches)
         self.since_calls: list[datetime] = []
+        self.now_malformed: set[str] = set()  # IDs that stop normalizing later
 
     async def fetch_since(self, since):
         self.since_calls.append(since)
         return self._batches.pop(0) if self._batches else []
 
     def normalize(self, raw):
-        if raw.get("malformed"):
+        if raw.get("malformed") or raw["id"] in self.now_malformed:
             raise ValueError("threatInfo is not an object")
         return Alert(
             source=self.name,
@@ -428,3 +429,35 @@ async def test_retry_keeps_the_original_alert_id():
     assert second.triaged == [alert_id]
     stored = await store.get(alert_id)
     assert stored is not None and stored.status == "triaged"
+
+
+async def test_an_unidentifiable_malformed_record_is_quarantined_once():
+    """With no readable vendor ID the quarantine keys on the payload itself;
+    a record refetched every cycle must not add a record every cycle."""
+    bad = {"id": "", "malformed": True, "threatInfo": ["not", "an", "object"]}
+    connector = FakeConnector([[bad] for _ in range(5)])
+    store = InMemoryStore()
+    worker = _worker(connector, FakeAnalyst(), store)
+
+    summaries = [await worker.poll_once() for _ in range(5)]
+
+    assert len(await store.list()) == 1
+    assert len(summaries[0].dead_lettered) == 1
+    assert all(s.dead_lettered == [] for s in summaries[1:])
+
+
+async def test_retry_that_stops_normalizing_keeps_its_id_and_leaves_the_queue():
+    payload = {"id": "a", "observed_at": datetime.now(UTC)}
+    connector = FakeConnector([[payload], []])
+    store = InMemoryStore()
+    worker = _worker(connector, FakeAnalyst(status="failed"), store, interval=0)
+
+    first = await worker.poll_once()
+    connector.now_malformed.add("a")
+    second = await worker.poll_once()
+
+    (alert_id,) = first.failed
+    assert second.dead_lettered == [alert_id]
+    stored = await store.get(alert_id)
+    assert stored is not None and stored.status == "dead_lettered"
+    assert worker._retries == {}

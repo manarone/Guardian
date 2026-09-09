@@ -7,10 +7,11 @@ process. Swap in a real backend by implementing the same interface.
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
+from itertools import islice
 
 from guardian.models import TriageResult
 
@@ -105,7 +106,12 @@ class InMemoryStore:
     async def list(self, limit: int = 50) -> list[TriageResult]:
         """Return the most recent results, newest first."""
         async with self._lock:
-            return list(reversed(list(self._items.values())))[:limit]
+            return list(islice(reversed(self._items.values()), max(limit, 0)))
+
+    async def status_counts(self) -> dict[str, int]:
+        """Count stored results by status, over everything the store holds."""
+        async with self._lock:
+            return dict(Counter(r.status for r in self._items.values()))
 
     async def find_by_host(
         self, hostname: str, since: datetime, limit: int = 50

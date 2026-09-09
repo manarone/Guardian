@@ -128,6 +128,28 @@ def test_ingest_rejects_a_non_ascii_token_with_401(client):
     assert response.status_code == 401
 
 
+def test_non_ascii_token_can_authenticate():
+    """The configured secret may contain non-ASCII; the client sends it as
+    UTF-8 bytes, Starlette decodes latin-1, and the comparison must still
+    recover the original bytes rather than reject the operator's own token."""
+    settings = Settings(s1_poll_enabled=False, webhook_token="s3cr\u00e9t", _env_file=None)
+    with TestClient(create_app(settings)) as client:
+        client.app.state.analyst = StubAnalyst()
+        ok = client.post(
+            "/v1/alerts",
+            json={"source": "manual", "title": "x"},
+            headers={b"X-Guardian-Token": "s3cr\u00e9t".encode("utf-8")},
+        )
+        bad = client.post(
+            "/v1/alerts",
+            json={"source": "manual", "title": "x"},
+            headers={b"X-Guardian-Token": "s3cr\u00e8t".encode("utf-8")},
+        )
+
+    assert ok.status_code == 201
+    assert bad.status_code == 401
+
+
 def test_ingest_rejects_a_missing_token(client):
     response = client.post("/v1/alerts", json={"source": "manual", "title": "x"})
     assert response.status_code == 401
@@ -149,6 +171,85 @@ def test_sentinelone_webhook_normalizes_before_triage(client):
     assert alert["source"] == "sentinelone"
     assert alert["title"] == "evil.exe"
     assert alert["host"]["hostname"] == "WIN-1"
+
+
+def test_sentinelone_webhook_rejects_a_malformed_payload_with_422(client):
+    """A payload the mapper cannot read is the caller's error. A 500 would
+    look like an outage and make the vendor keep redelivering it."""
+    headers = {"X-Guardian-Token": "s3cret"}
+    for payload in [
+        {"id": "1", "threatInfo": "not an object"},
+        {"id": "2", "threatInfo": {"threatName": "x", "engines": [1, 2]}},
+        {"id": "3", "threatInfo": {"threatName": "x"}, "indicators": ["x"]},
+    ]:
+        response = client.post("/v1/alerts/sentinelone", json=payload, headers=headers)
+        assert response.status_code == 422, payload
+        assert "SentinelOne" in response.json()["detail"]
+    assert client.app.state.analyst.calls == []
+
+
+def test_redelivery_returns_200_not_201(client):
+    payload = {"id": "dup-2", "threatInfo": {"threatName": "evil.exe"}}
+    headers = {"X-Guardian-Token": "s3cret"}
+
+    first = client.post("/v1/alerts/sentinelone", json=payload, headers=headers)
+    second = client.post("/v1/alerts/sentinelone", json=payload, headers=headers)
+
+    assert first.status_code == 201
+    assert second.status_code == 200
+
+
+def test_caller_supplied_alert_id_is_replaced(client):
+    """IDs are server-minted: a caller could otherwise overwrite another
+    alert's record by reusing an ID visible from GET /v1/triage."""
+    headers = {"X-Guardian-Token": "s3cret"}
+    victim = client.post("/v1/alerts", json={"source": "m", "title": "victim"}, headers=headers)
+    victim_id = victim.json()["alert_id"]
+
+    attacker = client.post(
+        "/v1/alerts", json={"id": victim_id, "source": "m", "title": "overwrite"}, headers=headers
+    )
+
+    assert attacker.json()["alert_id"] != victim_id
+    stored = client.get(f"/v1/triage/{victim_id}", headers=headers).json()
+    assert stored["alert"]["title"] == "victim"
+
+
+def test_webhook_retry_of_a_failed_attempt_keeps_its_alert_id(client):
+    """The poller and the webhook must agree on one ID per source alert, or a
+    failed attempt on one side orphans the ID the other side handed out."""
+    store = client.app.state.store
+    failed = Alert(source="sentinelone", source_id="T-9", title="first try")
+
+    async def seed():
+        await store.put(TriageResult(alert=failed, status="failed", error="timeout"))
+
+    client.portal.call(seed)
+
+    response = client.post(
+        "/v1/alerts/sentinelone",
+        json={"id": "T-9", "threatInfo": {"threatName": "x"}},
+        headers={"X-Guardian-Token": "s3cret"},
+    )
+
+    assert response.json()["alert_id"] == failed.id
+    assert response.json()["result"]["status"] == "triaged"
+
+
+def test_list_limit_is_bounded(client):
+    headers = {"X-Guardian-Token": "s3cret"}
+    assert client.get("/v1/triage?limit=-1", headers=headers).status_code == 422
+    assert client.get("/v1/triage?limit=0", headers=headers).status_code == 422
+    assert client.get("/v1/triage?limit=5000", headers=headers).status_code == 422
+    assert client.get("/v1/triage?limit=1", headers=headers).status_code == 200
+
+
+def test_log_level_must_be_understood_by_both_uvicorn_and_logging():
+    """ "warn" crashes uvicorn and "trace" crashes logging; reject both."""
+    for bad in ["warn", "fatal", "trace"]:
+        with pytest.raises(ValueError, match="GUARDIAN_LOG_LEVEL"):
+            Settings(webhook_token="t", log_level=bad, _env_file=None)
+    assert Settings(webhook_token="t", log_level="WARNING", _env_file=None).log_level == "warning"
 
 
 def test_unknown_alert_id_is_404(client):

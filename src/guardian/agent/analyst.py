@@ -68,15 +68,27 @@ class Analyst:
             self.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
         else:
             self.client = AsyncAnthropic()
+            if self.client.api_key is None and self.client.auth_token is None:
+                # Not fatal - the SDK may still resolve a profile at request
+                # time - but a deployment that simply forgot the key would
+                # otherwise fail every triage until the alerts dead-letter.
+                logger.warning(
+                    "No ANTHROPIC_API_KEY configured; relying on the SDK's own "
+                    "credential discovery. Every triage will fail if it finds none."
+                )
 
     async def triage(self, alert: Alert) -> TriageResult:
         result = TriageResult(alert=alert, model=self.settings.model)
         call_log: list[str] = []
         tools = build_tools(self.store, call_log, current=alert)
+        # Built once and shared by both phases: the verdict call must replay
+        # the investigation's exact prefix for the prompt cache to hit and for
+        # the verdict to be grounded in the same alert rendering.
+        system, opening = self._conversation(alert)
 
         try:
-            investigation = await self._investigate(alert, tools)
-            result.verdict = await self._render_verdict(alert, investigation)
+            investigation = await self._investigate(system, opening, tools)
+            result.verdict = await self._render_verdict(system, opening, investigation)
             result.status = "triaged"
         except RefusedError as exc:
             logger.warning("Triage refused for alert %s: %s", alert.id, exc)
@@ -92,51 +104,68 @@ class Analyst:
 
         return result
 
-    async def _investigate(self, alert: Alert, tools: list) -> str:
+    @staticmethod
+    def _conversation(alert: Alert) -> tuple[list[dict], dict]:
+        """The shared prefix of both model calls: system block and opening turn.
+
+        The frozen system prompt goes first so it forms a stable, cacheable
+        prefix across every alert; the volatile alert body goes in the user
+        turn, fenced as untrusted data.
+        """
+        system = [
+            {
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+        opening = {
+            "role": "user",
+            "content": TRIAGE_INSTRUCTION.format(alert=fence_alert(alert.summary())),
+        }
+        return system, opening
+
+    async def _investigate(self, system: list[dict], opening: dict, tools: list) -> str:
         """Run the enrichment tool loop and return the investigation text.
 
         Raises:
             RefusedError: the model declined to analyze the alert.
             RuntimeError: the turn ended without usable text, e.g. it hit
-                `max_tokens` before writing any. That is a failure to fix, not a
-                refusal, so it must not be reported as one.
+                `max_tokens` before writing any, or the tool loop hit its
+                iteration ceiling. Those are failures to fix, not refusals,
+                so they must not be reported as one.
         """
         runner = self.client.beta.messages.tool_runner(
             model=self.settings.model,
             max_tokens=self.settings.max_tokens,
-            # Frozen system prompt first so it forms a stable, cacheable prefix
-            # across every alert; the volatile alert body goes in `messages`.
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
+            max_iterations=self.settings.max_tool_iterations,
+            system=system,
             thinking={"type": "adaptive"},
             output_config={"effort": self.settings.effort},
             betas=[FALLBACK_BETA],
             fallbacks="default",
             tools=tools,
-            messages=[
-                {
-                    "role": "user",
-                    "content": TRIAGE_INSTRUCTION.format(alert=fence_alert(alert.summary())),
-                }
-            ],
+            messages=[opening],
         )
 
         final = await runner.until_done()
         if final.stop_reason == "refusal":
             category = getattr(final.stop_details, "category", None)
             raise RefusedError(f"Model declined to analyze this alert (category={category})")
+        if final.stop_reason == "tool_use":
+            # The runner returns mid-loop only when it hit `max_iterations`.
+            raise RuntimeError(
+                f"Investigation exceeded {self.settings.max_tool_iterations} tool iterations"
+            )
 
         text = "\n".join(b.text for b in final.content if b.type == "text").strip()
         if not text:
             raise RuntimeError(f"Investigation returned no text (stop_reason={final.stop_reason})")
         return text
 
-    async def _render_verdict(self, alert: Alert, investigation: str) -> Verdict:
+    async def _render_verdict(
+        self, system: list[dict], opening: dict, investigation: str
+    ) -> Verdict:
         """Convert the investigation into a schema-valid verdict.
 
         Raises:
@@ -146,19 +175,10 @@ class Analyst:
         response = await self.client.messages.parse(
             model=self.settings.model,
             max_tokens=self.settings.max_tokens,
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
+            system=system,
             thinking={"type": "adaptive"},
             messages=[
-                {
-                    "role": "user",
-                    "content": TRIAGE_INSTRUCTION.format(alert=fence_alert(alert.summary())),
-                },
+                opening,
                 {"role": "assistant", "content": investigation},
                 {"role": "user", "content": VERDICT_INSTRUCTION},
             ],

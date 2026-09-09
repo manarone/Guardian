@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -39,12 +41,7 @@ class PollSummary:
     # Model calls made this cycle. Tracked directly rather than summed from the
     # lists above, because an alert can be dead-lettered by queue eviction
     # without being triaged this cycle.
-    attempts: int = 0
-
-    @property
-    def processed(self) -> int:
-        """Alerts this cycle made a model call for."""
-        return self.attempts
+    processed: int = 0
 
 
 @dataclass
@@ -139,10 +136,10 @@ class PollingWorker:
         summary = PollSummary()
 
         # Retries first, so a backlog drains even while new alerts keep arriving.
-        for pending in self._due_retries():
-            alert = await self._normalize(pending.raw, summary)
+        for key, pending in self._due_retries():
+            alert = await self._normalize(pending.raw, summary, alert_id=pending.alert_id)
             if alert is None:
-                self._retries.pop(self._retry_key_from_raw(pending), None)
+                self._retries.pop(key, None)
                 continue
             alert = alert.model_copy(update={"id": pending.alert_id})
             await self._triage_one(alert, pending.raw, summary)
@@ -192,39 +189,47 @@ class PollingWorker:
             )
         return summary
 
-    async def _normalize(self, raw: Any, summary: PollSummary) -> Alert | None:
+    async def _normalize(
+        self, raw: Any, summary: PollSummary, alert_id: str | None = None
+    ) -> Alert | None:
         """Normalize one payload, quarantining it if the connector cannot.
 
         A record that raises must not abort the batch: the fetch is inclusive,
         so the same record would come back on every cycle and everything
-        behind it would never reach triage. It is stored as dead-lettered
-        under whatever identity the connector can still read, which also
-        makes the next fetch skip it.
+        behind it would never reach triage. It is stored once as dead-lettered
+        under a stable identity - the vendor's ID if the connector can still
+        read one, else a digest of the payload - so every later refetch is
+        recognized and skipped instead of stored again.
         """
         try:
             return self.connector.normalize(raw)
         except Exception as exc:
-            source_id = self.connector.identify(raw)
-            logger.exception(
-                "%s record %s could not be normalized; quarantining it",
-                self.connector.name,
-                source_id or "<no id>",
-            )
-            if source_id and await self.store.has_seen(self.connector.name, source_id):
-                return None  # already quarantined on an earlier cycle
+            source_id = self.connector.identify(raw) or f"unparseable-{_digest(raw)}"
+            source = self.connector.name
 
-            alert = Alert(
-                source=self.connector.name,
-                source_id=source_id,
-                title=f"Unparseable {self.connector.name} record",
-                raw=raw if isinstance(raw, dict) else {"payload": repr(raw)[:2000]},
-            )
-            result = TriageResult(
-                alert=alert,
-                status="dead_lettered",
-                error=f"normalize failed: {type(exc).__name__}: {exc}",
-            )
-            await self.store.put(result)
+            async with self.store.lock_source(source, source_id):
+                if await self.store.has_seen(source, source_id):
+                    logger.debug("%s record %s is already quarantined", source, source_id)
+                    return None
+
+                logger.exception(
+                    "%s record %s could not be normalized; quarantining it", source, source_id
+                )
+                alert = Alert(
+                    source=source,
+                    source_id=source_id,
+                    title=f"Unparseable {source} record",
+                    raw=raw if isinstance(raw, dict) else {"payload": repr(raw)[:2000]},
+                )
+                if alert_id is not None:
+                    # A retry keeps the ID its first attempt was reported under.
+                    alert = alert.model_copy(update={"id": alert_id})
+                result = TriageResult(
+                    alert=alert,
+                    status="dead_lettered",
+                    error=f"normalize failed: {type(exc).__name__}: {exc}",
+                )
+                await self.store.put(result)
             summary.dead_lettered.append(alert.id)
             return None
 
@@ -248,7 +253,7 @@ class PollingWorker:
     async def _triage_and_record(
         self, alert: Alert, raw: dict[str, Any], key: SourceKey | None, summary: PollSummary
     ) -> None:
-        summary.attempts += 1
+        summary.processed += 1
         result = await self.analyst.triage(alert)
 
         if result.status == "triaged":
@@ -274,9 +279,9 @@ class PollingWorker:
         for dropped_key, dropped in self._evict_overflow():
             await self._dead_letter_evicted(dropped_key, dropped, summary)
 
-    def _due_retries(self) -> list[_PendingRetry]:
+    def _due_retries(self) -> list[tuple[SourceKey, _PendingRetry]]:
         now = datetime.now(UTC)
-        return [p for p in list(self._retries.values()) if p.next_attempt <= now]
+        return [(k, p) for k, p in list(self._retries.items()) if p.next_attempt <= now]
 
     def _schedule_retry(
         self, key: SourceKey | None, raw: dict[str, Any], alert_id: str
@@ -361,12 +366,14 @@ class PollingWorker:
         if key is not None:
             self._retries.pop(key, None)
 
-    def _retry_key_from_raw(self, pending: _PendingRetry) -> SourceKey | None:
-        source_id = self.connector.identify(pending.raw)
-        return (self.connector.name, source_id) if source_id else None
-
     @staticmethod
     def _retry_key(alert: Alert) -> SourceKey | None:
         if not alert.source_id:
             return None
         return (alert.source, alert.source_id)
+
+
+def _digest(raw: Any) -> str:
+    """Stable short fingerprint of a payload, for records with no readable ID."""
+    encoded = json.dumps(raw, sort_keys=True, default=repr).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]

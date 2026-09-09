@@ -91,3 +91,14 @@ async def test_source_keys_do_not_collide_on_the_separator():
     assert await store.has_seen("a:b", "c") is True
     assert await store.has_seen("a", "b:c") is False
     assert await store.get_by_source("a", "b:c") is None
+
+
+async def test_status_counts_cover_the_whole_store():
+    store = InMemoryStore(max_items=3000)
+    for i in range(1500):
+        alert = Alert(source="m", title=str(i))
+        await store.put(TriageResult(alert=alert, status="triaged" if i % 2 else "failed"))
+
+    counts = await store.status_counts()
+
+    assert counts == {"triaged": 750, "failed": 750}

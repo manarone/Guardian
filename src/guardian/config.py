@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     model: str = "claude-opus-5"
     effort: str = "high"
     max_tokens: int = 16000
+    # Ceiling on tool-call round trips per investigation. Without one, an
+    # alert that keeps the model probing unconfigured tools has no cost bound.
+    max_tool_iterations: int = Field(default=12, ge=1)
 
     # SentinelOne
     s1_base_url: str = ""
@@ -40,6 +43,22 @@ class Settings(BaseSettings):
     # unset webhook token unless this is explicitly turned on, so an unconfigured
     # deployment fails closed instead of accepting anonymous alerts.
     allow_unauthenticated: bool = False
+
+    @field_validator("log_level")
+    @classmethod
+    def _known_log_level(cls, value: str) -> str:
+        """Accept only levels both uvicorn and `logging` understand.
+
+        Their vocabularies differ ("warn" and "fatal" are logging-only,
+        "trace" is uvicorn-only), so an unvalidated value can crash one or
+        the other at startup.
+        """
+        level = value.lower()
+        if level not in {"critical", "error", "warning", "info", "debug"}:
+            raise ValueError(
+                f"GUARDIAN_LOG_LEVEL={value!r} is not one of critical, error, warning, info, debug"
+            )
+        return level
 
     @property
     def sentinelone_configured(self) -> bool:
