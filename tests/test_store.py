@@ -64,3 +64,18 @@ async def test_retry_supersedes_the_failed_attempt():
     assert await store.has_seen("sentinelone", "1")
     assert (await store.get(failed.alert.id)) is None
     assert len(await store.list()) == 1
+
+
+async def test_reused_alert_id_does_not_leave_a_stale_source_mapping():
+    """/v1/alerts accepts caller-supplied IDs; two source alerts sharing one
+    must not make the first look seen and hand back the second's result."""
+    store = InMemoryStore()
+    first = Alert(id="shared", source="m", source_id="one", title="one")
+    second = Alert(id="shared", source="m", source_id="two", title="two")
+
+    await store.put(TriageResult(alert=first, status="triaged"))
+    await store.put(TriageResult(alert=second, status="triaged"))
+
+    assert await store.has_seen("m", "one") is False
+    assert await store.get_by_source("m", "one") is None
+    assert await store.has_seen("m", "two") is True

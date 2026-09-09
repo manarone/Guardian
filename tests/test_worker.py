@@ -325,3 +325,55 @@ async def test_alert_without_source_id_is_dead_lettered_not_failed():
     assert summary.failed == []
     assert len(summary.dead_lettered) == 1
     assert (await worker.store.list())[0].status == "dead_lettered"
+
+
+async def test_alert_without_a_cursor_does_not_advance_the_watermark():
+    payload = {"id": "a", "observed_at": datetime.now(UTC)}  # no cursor_at
+    connector = FakeConnector([[payload], []])
+    worker = _worker(connector, FakeAnalyst())
+    before = worker._since
+
+    await worker.poll_once()
+    await worker.poll_once()
+
+    assert worker._since == before
+    assert connector.since_calls[1] == before
+
+
+async def test_eviction_does_not_overwrite_a_verdict_the_webhook_produced(monkeypatch):
+    """A queued retry can go stale if a webhook finishes the alert first.
+    Evicting that stale entry must discard it, not dead-letter the verdict."""
+    monkeypatch.setattr("guardian.worker.MAX_PENDING_RETRIES", 1)
+    base = datetime.now(UTC) - timedelta(minutes=10)
+    first = {"id": "a", "observed_at": base, "cursor_at": base}
+    second = {"id": "b", "observed_at": base, "cursor_at": base + timedelta(seconds=1)}
+    connector = FakeConnector([[first], [second]])
+    store = InMemoryStore()
+    worker = _worker(connector, FakeAnalyst(status="failed"), store, interval=3600)
+
+    await worker.poll_once()  # 'a' fails and is queued
+    webhook_alert = Alert(source="sentinelone", source_id="a", title="a")
+    await store.put(TriageResult(alert=webhook_alert, status="triaged"))
+
+    summary = await worker.poll_once()  # 'b' fails; queue is full, 'a' evicted
+
+    stored = await store.get_by_source("sentinelone", "a")
+    assert stored is not None and stored.status == "triaged"
+    assert summary.dead_lettered == []
+    assert "sentinelone:a" not in worker._retries
+
+
+async def test_processed_counts_model_calls_not_evictions(monkeypatch):
+    monkeypatch.setattr("guardian.worker.MAX_PENDING_RETRIES", 1)
+    base = datetime.now(UTC) - timedelta(minutes=10)
+    first = {"id": "a", "observed_at": base, "cursor_at": base}
+    second = {"id": "b", "observed_at": base, "cursor_at": base + timedelta(seconds=1)}
+    connector = FakeConnector([[first], [second]])
+    worker = _worker(connector, FakeAnalyst(status="failed"), interval=3600)
+
+    await worker.poll_once()
+    summary = await worker.poll_once()
+
+    assert len(summary.failed) == 1  # 'b'
+    assert len(summary.dead_lettered) == 1  # 'a', evicted without a call
+    assert summary.processed == 1

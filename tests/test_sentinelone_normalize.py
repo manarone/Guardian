@@ -99,3 +99,20 @@ def test_timestamp_format_matches_what_the_s1_api_expects():
 def test_connector_requires_credentials():
     with pytest.raises(ValueError):
         SentinelOneConnector(base_url="", api_token="")
+
+
+def test_missing_created_at_leaves_the_cursor_unset():
+    """A wall-clock fallback would become the poll watermark and skip threats
+    created between the API snapshot and now. Unknown means unknown."""
+    alert = normalize_threat({"id": "1", "threatInfo": {"threatName": "x"}})
+
+    assert alert.cursor_at is None
+    assert alert.observed_at is not None  # display time may still default
+
+
+def test_malformed_created_at_leaves_the_cursor_unset():
+    alert = normalize_threat(
+        {"id": "1", "threatInfo": {"threatName": "x", "createdAt": "not a date"}}
+    )
+
+    assert alert.cursor_at is None

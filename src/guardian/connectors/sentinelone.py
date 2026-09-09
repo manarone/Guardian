@@ -123,9 +123,13 @@ def normalize_threat(raw: dict[str, Any]) -> Alert:
         title=info.get("threatName") or "SentinelOne threat",
         description=_build_description(info),
         severity=_map_severity(info),
-        observed_at=_parse_timestamp(info.get("identifiedAt") or info.get("createdAt")),
+        observed_at=_parse_timestamp(info.get("identifiedAt") or info.get("createdAt"))
+        or datetime.now(UTC),
         # Pagination is on createdAt, which trails identifiedAt - keep them apart.
-        cursor_at=_parse_timestamp(info.get("createdAt") or info.get("identifiedAt")),
+        # Only the source's own pagination field, and only when it parses. A
+        # wall-clock fallback here would become the worker's watermark and skip
+        # every threat created between the API snapshot and now.
+        cursor_at=_parse_timestamp(info.get("createdAt")),
         classification=info.get("classification"),
         mitre_techniques=_extract_techniques(raw.get("indicators") or []),
         indicators=indicators,
@@ -196,13 +200,14 @@ def _extract_techniques(indicators: list[dict[str, Any]]) -> list[str]:
     return techniques
 
 
-def _parse_timestamp(value: Any) -> datetime:
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp, or return None if there is nothing usable."""
     if isinstance(value, str):
         try:
             return datetime.fromisoformat(value)
         except ValueError:
             logger.debug("Unparseable SentinelOne timestamp: %r", value)
-    return datetime.now(UTC)
+    return None
 
 
 def _to_s1_timestamp(value: datetime) -> str:

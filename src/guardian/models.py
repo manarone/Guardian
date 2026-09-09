@@ -81,7 +81,8 @@ class Alert(BaseModel):
             "`observed_at`. SentinelOne pages on createdAt but reports "
             "identifiedAt as the detection time, and the two differ. The worker "
             "advances its high-water mark with this so the cursor always speaks "
-            "the source's own units."
+            "the source's own units. Leave it None when the source did not "
+            "supply one; the worker then holds its cursor rather than guess."
         ),
     )
 

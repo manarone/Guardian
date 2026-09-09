@@ -12,7 +12,7 @@ from typing import Any
 from guardian.agent.analyst import Analyst
 from guardian.connectors.base import Connector
 from guardian.models import Alert, TriageResult
-from guardian.store import InMemoryStore
+from guardian.store import TERMINAL_STATUSES, InMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +36,15 @@ class PollSummary:
     failed: list[str] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)
     dead_lettered: list[str] = field(default_factory=list)
+    # Model calls made this cycle. Tracked directly rather than summed from the
+    # lists above, because an alert can be dead-lettered by queue eviction
+    # without being triaged this cycle.
+    attempts: int = 0
 
     @property
     def processed(self) -> int:
-        """Alerts this cycle made a model call for. Every ID is in exactly one list."""
-        return len(self.triaged) + len(self.failed) + len(self.refused) + len(self.dead_lettered)
+        """Alerts this cycle made a model call for."""
+        return self.attempts
 
 
 @dataclass
@@ -137,9 +141,17 @@ class PollingWorker:
 
         for raw in raw_alerts:
             alert = self.connector.normalize(raw)
-            # Track the source's own pagination field, not the detection time.
-            cursor = alert.cursor_at or alert.observed_at
-            batch_cursor = max(batch_cursor, cursor)
+            # Advance only on the source's own pagination field. An alert
+            # without one holds the cursor: guessing (say, from wall-clock
+            # time) could jump past alerts the source has not shown us yet.
+            if alert.cursor_at is not None:
+                batch_cursor = max(batch_cursor, alert.cursor_at)
+            else:
+                logger.warning(
+                    "%s alert %s carries no cursor timestamp; not advancing past it",
+                    self.connector.name,
+                    alert.source_id or alert.id,
+                )
 
             key = self._retry_key(alert)
             if key is not None and key in self._retries:
@@ -190,6 +202,7 @@ class PollingWorker:
     async def _triage_and_record(
         self, alert: Alert, raw: dict[str, Any], key: str | None, summary: PollSummary
     ) -> None:
+        summary.attempts += 1
         result = await self.analyst.triage(alert)
 
         if result.status == "triaged":
@@ -260,22 +273,28 @@ class PollingWorker:
         self, key: str, pending: _PendingRetry, summary: PollSummary
     ) -> None:
         alert = self.connector.normalize(pending.raw)
-        # Prefer the stored attempt so its error and audit trail survive; fall
-        # back to a fresh record only if the store already evicted it.
-        existing = None
-        if alert.source_id:
+        if not alert.source_id:
+            return  # cannot have been queued without one
+
+        async with self.store.lock_source(alert.source, alert.source_id):
             existing = await self.store.get_by_source(alert.source, alert.source_id)
-        result = existing or TriageResult(alert=alert, status="failed", model=None)
-        result = self._dead_letter(
-            result,
-            f"retry queue exceeded {MAX_PENDING_RETRIES}; evicted after "
-            f"{pending.attempts} attempt(s)",
-        )
-        # It may have been counted as a retryable failure earlier this cycle.
-        if result.alert.id in summary.failed:
-            summary.failed.remove(result.alert.id)
-        summary.dead_lettered.append(result.alert.id)
-        await self.store.put(result)
+            if existing is not None and existing.status in TERMINAL_STATUSES:
+                # A webhook finished this alert while it waited for backoff.
+                # The queue entry was stale; the verdict stands.
+                return
+
+            # Prefer the stored attempt so its error and audit trail survive;
+            # fall back to a fresh record only if the store already evicted it.
+            result = self._dead_letter(
+                existing or TriageResult(alert=alert, status="failed"),
+                f"retry queue exceeded {MAX_PENDING_RETRIES}; evicted after "
+                f"{pending.attempts} attempt(s)",
+            )
+            # It may have been counted as a retryable failure earlier this cycle.
+            if result.alert.id in summary.failed:
+                summary.failed.remove(result.alert.id)
+            summary.dead_lettered.append(result.alert.id)
+            await self.store.put(result)
 
     @staticmethod
     def _dead_letter(result: TriageResult, reason: str) -> TriageResult:

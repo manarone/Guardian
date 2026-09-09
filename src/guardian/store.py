@@ -40,6 +40,21 @@ class InMemoryStore:
         """Store a result, superseding any earlier attempt at the same alert."""
         async with self._lock:
             key = self._source_key(result)
+
+            # `/v1/alerts` accepts a caller-supplied ID, so this write may
+            # replace a different source alert's record. Drop that alert's
+            # source mapping, or a redelivery of it would be "seen" and handed
+            # this unrelated result.
+            replaced = self._items.get(result.alert.id)
+            if replaced is not None:
+                replaced_key = self._source_key(replaced)
+                if (
+                    replaced_key is not None
+                    and replaced_key != key
+                    and self._by_source.get(replaced_key) == result.alert.id
+                ):
+                    del self._by_source[replaced_key]
+
             if key is not None:
                 previous = self._by_source.get(key)
                 if previous is not None and previous != result.alert.id:
