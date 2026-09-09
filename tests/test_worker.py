@@ -135,3 +135,53 @@ async def test_cursor_is_not_committed_when_the_batch_raises():
         pass
 
     assert worker._since == original_since
+
+
+async def test_cursor_does_not_advance_past_a_failed_alert():
+    """A later success must not strand an earlier failure beyond the watermark."""
+    base = datetime.now(UTC) - timedelta(minutes=10)
+    batch = [
+        {"id": "fails", "observed_at": base, "cursor_at": base},
+        {"id": "works", "observed_at": base, "cursor_at": base + timedelta(seconds=30)},
+    ]
+
+    class Selective(FakeAnalyst):
+        async def triage(self, alert):
+            self.calls.append(alert.source_id)
+            status = "failed" if alert.source_id == "fails" else "triaged"
+            return TriageResult(alert=alert, status=status)
+
+    connector = FakeConnector([batch, []])
+    worker = _worker(connector, Selective())
+
+    await worker.poll_once()
+    await worker.poll_once()
+
+    # Watermark held at the failed alert's cursor, not the later success's.
+    assert connector.since_calls[1] == base
+
+
+async def test_summary_separates_failed_and_refused_from_triaged():
+    base = datetime.now(UTC) - timedelta(minutes=10)
+    connector = FakeConnector([[{"id": "a", "observed_at": base, "cursor_at": base}]])
+    worker = _worker(connector, FakeAnalyst(status="failed"))
+
+    summary = await worker.poll_once()
+
+    assert summary.triaged == []
+    assert summary.failed == [(await worker.store.list())[0].alert.id]
+    assert summary.processed == 1
+
+
+async def test_refused_is_reported_separately_and_not_retried():
+    base = datetime.now(UTC) - timedelta(minutes=10)
+    payload = {"id": "a", "observed_at": base, "cursor_at": base}
+    connector = FakeConnector([[payload], [payload]])
+    analyst = FakeAnalyst(status="refused")
+    worker = _worker(connector, analyst)
+
+    summary = await worker.poll_once()
+    await worker.poll_once()
+
+    assert len(summary.refused) == 1
+    assert analyst.calls == ["a"]

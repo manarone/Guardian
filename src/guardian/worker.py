@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from guardian.agent.analyst import Analyst
@@ -11,6 +12,23 @@ from guardian.connectors.base import Connector
 from guardian.store import InMemoryStore
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PollSummary:
+    """Outcome of one poll cycle, split by status.
+
+    Kept separate so a run during a model outage cannot look like a successful
+    one: only `triaged` means a verdict was produced.
+    """
+
+    triaged: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    refused: list[str] = field(default_factory=list)
+
+    @property
+    def processed(self) -> int:
+        return len(self.triaged) + len(self.failed) + len(self.refused)
 
 
 class PollingWorker:
@@ -71,8 +89,8 @@ class PollingWorker:
                 logger.exception("Poll cycle failed for %s", self.connector.name)
             await asyncio.sleep(self.interval)
 
-    async def poll_once(self) -> list[str]:
-        """Fetch, deduplicate, and triage one batch. Returns triaged alert IDs.
+    async def poll_once(self) -> PollSummary:
+        """Fetch, deduplicate, and triage one batch.
 
         Serialized against concurrent callers - the scheduled loop and a manual
         `POST /v1/poll` would otherwise race on the dedupe check.
@@ -80,10 +98,13 @@ class PollingWorker:
         async with self._poll_lock:
             return await self._poll_once_locked()
 
-    async def _poll_once_locked(self) -> list[str]:
+    async def _poll_once_locked(self) -> PollSummary:
         raw_alerts = await self.connector.fetch_since(self._since)
-        triaged: list[str] = []
+        summary = PollSummary()
         batch_cursor = self._since
+        # Earliest cursor among alerts that failed this cycle. The watermark must
+        # not move past it, or the inclusive refetch can never reach them again.
+        retry_floor: datetime | None = None
 
         for raw in raw_alerts:
             alert = self.connector.normalize(raw)
@@ -96,15 +117,28 @@ class PollingWorker:
 
             result = await self.analyst.triage(alert)
             await self.store.put(result)
-            triaged.append(alert.id)
 
-        # Commit the high-water mark only once the whole batch is processed. If
-        # this cycle raises partway, `_since` is untouched and the next cycle
-        # refetches the batch; dedupe drops whatever already landed. Advancing
-        # per alert would instead skip an unprocessed alert that shares a
-        # timestamp with one already handled.
-        self._since = batch_cursor
+            if result.status == "triaged":
+                summary.triaged.append(alert.id)
+            elif result.status == "refused":
+                # Terminal: a refusal needs a human, and retrying only burns tokens.
+                summary.refused.append(alert.id)
+            else:
+                summary.failed.append(alert.id)
+                retry_floor = cursor if retry_floor is None else min(retry_floor, cursor)
 
-        if triaged:
-            logger.info("Triaged %d new %s alert(s)", len(triaged), self.connector.name)
-        return triaged
+        # Commit the high-water mark once, after the batch. If this cycle raises
+        # partway, `_since` is untouched and the next cycle refetches the batch;
+        # dedupe drops whatever already landed. A failed alert holds the
+        # watermark at its own cursor so the next cycle can still reach it.
+        self._since = retry_floor if retry_floor is not None else batch_cursor
+
+        if summary.processed:
+            logger.info(
+                "%s poll: %d triaged, %d failed, %d refused",
+                self.connector.name,
+                len(summary.triaged),
+                len(summary.failed),
+                len(summary.refused),
+            )
+        return summary

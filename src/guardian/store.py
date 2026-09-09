@@ -57,6 +57,12 @@ class InMemoryStore:
         async with self._lock:
             return list(reversed(list(self._items.values())))[:limit]
 
+    async def get_by_source(self, source: str, source_id: str) -> TriageResult | None:
+        """Return the latest attempt at a source alert, whatever its status."""
+        async with self._lock:
+            alert_id = self._by_source.get(self._key(source, source_id))
+            return self._items.get(alert_id) if alert_id else None
+
     async def has_seen(self, source: str, source_id: str) -> bool:
         """Report whether this source alert already reached a terminal verdict.
 

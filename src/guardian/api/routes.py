@@ -97,22 +97,47 @@ async def ingest_sentinelone_alert(
     payload: dict[str, Any],
     x_guardian_token: Annotated[str | None, Header()] = None,
 ) -> IngestResponse:
-    """Triage a raw SentinelOne threat object, normalizing it on the way in."""
+    """Triage a raw SentinelOne threat object, normalizing it on the way in.
+
+    Redelivery is common - SentinelOne retries webhooks, and one can race the
+    poller - so an already-triaged threat returns its existing result rather
+    than paying for a second model call and orphaning the first alert ID.
+    """
     _authorize(request, x_guardian_token)
 
     alert = normalize_threat(payload)
+    store = request.app.state.store
+
+    if alert.source_id and await store.has_seen(alert.source, alert.source_id):
+        existing = await store.get_by_source(alert.source, alert.source_id)
+        if existing is not None:
+            logger.info("Returning existing triage for %s:%s", alert.source, alert.source_id)
+            return IngestResponse(alert_id=existing.alert.id, result=existing)
+
     result = await request.app.state.analyst.triage(alert)
-    await request.app.state.store.put(result)
+    await store.put(result)
     return IngestResponse(alert_id=alert.id, result=result)
 
 
 @router.get("/v1/triage", response_model=list[TriageResult])
-async def list_triage(request: Request, limit: int = 50) -> list[TriageResult]:
+async def list_triage(
+    request: Request,
+    limit: int = 50,
+    x_guardian_token: Annotated[str | None, Header()] = None,
+) -> list[TriageResult]:
+    """List recent results. Authenticated: results carry the raw vendor payload."""
+    _authorize(request, x_guardian_token)
     return await request.app.state.store.list(limit=limit)
 
 
 @router.get("/v1/triage/{alert_id}", response_model=TriageResult)
-async def get_triage(request: Request, alert_id: str) -> TriageResult:
+async def get_triage(
+    request: Request,
+    alert_id: str,
+    x_guardian_token: Annotated[str | None, Header()] = None,
+) -> TriageResult:
+    """Fetch one result. Authenticated: see `list_triage`."""
+    _authorize(request, x_guardian_token)
     result = await request.app.state.store.get(alert_id)
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown alert ID")
@@ -131,5 +156,10 @@ async def poll_now(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="No connector is configured; set GUARDIAN_S1_BASE_URL and GUARDIAN_S1_API_TOKEN",
         )
-    triaged = await worker.poll_once()
-    return {"triaged": len(triaged), "alert_ids": triaged}
+    summary = await worker.poll_once()
+    return {
+        "processed": summary.processed,
+        "triaged": summary.triaged,
+        "failed": summary.failed,
+        "refused": summary.refused,
+    }

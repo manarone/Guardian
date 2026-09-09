@@ -83,10 +83,13 @@ curl -X POST localhost:8000/v1/alerts/sentinelone \
 | `GET` | `/v1/triage/{alert_id}` | One triage result |
 | `POST` | `/v1/poll` | Run a SentinelOne poll cycle now |
 
+Every endpoint except `/healthz` requires the `X-Guardian-Token` header. Reads
+are authenticated too: a `TriageResult` embeds the original vendor payload,
+including host, user, process, and indicator data.
+
 Interactive docs at `/docs` while the service is running.
 
-Write endpoints require the `X-Guardian-Token` header. Guardian **refuses to
-start** without `GUARDIAN_WEBHOOK_TOKEN` set, so an unconfigured deployment
+Guardian **refuses to start** without `GUARDIAN_WEBHOOK_TOKEN` set, so an unconfigured deployment
 fails closed rather than accepting anonymous alerts. For local development,
 `GUARDIAN_ALLOW_UNAUTHENTICATED=true` opts out explicitly.
 

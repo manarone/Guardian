@@ -4,14 +4,20 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="GUARDIAN_", extra="ignore")
 
-    # Claude. The API key itself is read by the SDK from ANTHROPIC_API_KEY (or an
-    # `ant auth login` profile), so it is deliberately not duplicated here.
+    # Claude. Declared with an explicit alias so it is read unprefixed, and so a
+    # key placed only in .env reaches the SDK: pydantic-settings reads .env for
+    # declared fields but never exports it to os.environ, so a bare
+    # AsyncAnthropic() would not see it. Left empty, the SDK falls back to its
+    # own resolution (ANTHROPIC_API_KEY in the real environment, or an
+    # `ant auth login` profile).
+    anthropic_api_key: str = Field(default="", validation_alias="ANTHROPIC_API_KEY")
     model: str = "claude-opus-5"
     effort: str = "high"
     max_tokens: int = 16000

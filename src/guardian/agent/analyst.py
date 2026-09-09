@@ -54,9 +54,15 @@ class Analyst:
     ) -> None:
         self.settings = settings
         self.store = store
-        # Zero-arg construction resolves ANTHROPIC_API_KEY or an `ant auth login`
-        # profile from the environment.
-        self.client = client or AsyncAnthropic()
+        # An explicit key covers the documented .env flow; without one, zero-arg
+        # construction lets the SDK resolve ANTHROPIC_API_KEY or an
+        # `ant auth login` profile itself.
+        if client is not None:
+            self.client = client
+        elif settings.anthropic_api_key:
+            self.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+        else:
+            self.client = AsyncAnthropic()
 
     async def triage(self, alert: Alert) -> TriageResult:
         result = TriageResult(alert=alert, model=self.settings.model)

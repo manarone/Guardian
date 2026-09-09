@@ -60,7 +60,7 @@ def test_ingest_triages_and_stores_an_alert(client):
     assert body["result"]["status"] == "triaged"
     assert body["result"]["verdict"]["disposition"] == "true_positive"
 
-    stored = client.get(f"/v1/triage/{body['alert_id']}")
+    stored = client.get(f"/v1/triage/{body['alert_id']}", headers={"X-Guardian-Token": "s3cret"})
     assert stored.status_code == 200
     assert stored.json()["alert"]["title"] == "Suspicious PowerShell"
 
@@ -96,7 +96,30 @@ def test_sentinelone_webhook_normalizes_before_triage(client):
 
 
 def test_unknown_alert_id_is_404(client):
-    assert client.get("/v1/triage/does-not-exist").status_code == 404
+    response = client.get("/v1/triage/does-not-exist", headers={"X-Guardian-Token": "s3cret"})
+    assert response.status_code == 404
+
+
+def test_triage_reads_require_authentication(client):
+    """Results embed the raw vendor payload - host, user, process, indicators."""
+    assert client.get("/v1/triage").status_code == 401
+    assert client.get("/v1/triage/anything").status_code == 401
+
+
+def test_healthz_stays_public(client):
+    assert client.get("/healthz").status_code == 200
+
+
+def test_sentinelone_webhook_redelivery_reuses_the_existing_result(client):
+    """Redelivery must not pay for a second triage or orphan the first alert ID."""
+    payload = {"id": "dup-1", "threatInfo": {"threatName": "evil.exe"}}
+    headers = {"X-Guardian-Token": "s3cret"}
+
+    first = client.post("/v1/alerts/sentinelone", json=payload, headers=headers).json()
+    second = client.post("/v1/alerts/sentinelone", json=payload, headers=headers).json()
+
+    assert first["alert_id"] == second["alert_id"]
+    assert len(client.app.state.analyst.calls) == 1
 
 
 def test_poll_without_a_connector_is_503(client):
