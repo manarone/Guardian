@@ -1,6 +1,6 @@
 # Guardian
 
-Guardian is an AI security analyst agent for SIEM/EDR alerts and logs.
+Guardian is a provider-agnostic AI security analyst agent for SIEM/EDR alerts and logs.
 
 It ingests security alerts, enriches them with context, and returns a structured
 verdict — disposition, confidence, reasoning, and recommended actions — so
@@ -11,8 +11,9 @@ containment actions.
 
 ## Status
 
-Early scaffold. The service runs, the SentinelOne connector and the triage
-pipeline are implemented, and the enrichment tools other than
+Early scaffold. The service runs, supports OpenAI-compatible and native Anthropic
+model endpoints, and includes a SentinelOne connector and triage pipeline. The
+enrichment tools other than
 `search_related_alerts` are stubs awaiting your threat-intel and asset sources.
 
 ## How it works
@@ -40,11 +41,12 @@ webhook POST  ───────┘                                   │    
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-cp .env.example .env      # add your ANTHROPIC_API_KEY and SentinelOne token
+cp .env.example .env      # set a provider, endpoint, model, model key, and webhook token
 guardian                  # or: uvicorn --factory guardian.api.app:create_app --reload
 ```
 
-Guardian runs without SentinelOne credentials — it just won't poll. Push an
+Guardian runs without SentinelOne credentials — it just won't poll. Once a model
+provider and `GUARDIAN_WEBHOOK_TOKEN` are configured, push an
 alert in directly:
 
 ```bash
@@ -95,14 +97,21 @@ fails closed rather than accepting anonymous alerts. For local development,
 
 ## Configuration
 
+The model provider is deliberately not defaulted. Set all of `GUARDIAN_PROVIDER`,
+`GUARDIAN_BASE_URL`, and `GUARDIAN_MODEL` for a deployment. The example file uses
+Neuralwatt and GLM 5.3 Flash as one possible OpenAI-compatible configuration.
+
 All settings are environment variables prefixed `GUARDIAN_`, or a `.env` file.
-See `.env.example`. The Anthropic API key is the exception: the SDK reads
+See `.env.example`. Set `GUARDIAN_API_KEY` for OpenAI-compatible providers. Native Anthropic also accepts
 `ANTHROPIC_API_KEY` (or an `ant auth login` profile) directly.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GUARDIAN_MODEL` | `claude-opus-5` | Model used for triage |
-| `GUARDIAN_EFFORT` | `high` | Thinking effort: `low`–`max` |
+| `GUARDIAN_PROVIDER` | — | `openai` for OpenAI-compatible APIs or `anthropic` for native Messages APIs (required) |
+| `GUARDIAN_BASE_URL` | — | Provider base URL (required; e.g. `https://api.neuralwatt.com/v1`) |
+| `GUARDIAN_API_KEY` | — | Generic provider API key; use `ANTHROPIC_API_KEY` for native Anthropic |
+| `GUARDIAN_MODEL` | — | Provider model ID (required; e.g. `glm-5.3-flash`) |
+| `GUARDIAN_EFFORT` | `high` | Thinking effort where supported: `low`–`max` |
 | `GUARDIAN_S1_BASE_URL` | — | SentinelOne console URL |
 | `GUARDIAN_S1_API_TOKEN` | — | SentinelOne API token |
 | `GUARDIAN_S1_POLL_INTERVAL` | `60` | Seconds between polls |
@@ -113,7 +122,7 @@ See `.env.example`. The Anthropic API key is the exception: the SDK reads
 ## Development
 
 ```bash
-pytest              # 18 tests, no API calls — the analyst is stubbed
+pytest              # 81 tests, no API calls — the analyst is stubbed
 ruff check src tests
 ruff format src tests
 ```
@@ -138,7 +147,7 @@ restart. Implement the same four methods against a real database and swap it in
 ## Design notes
 
 - **Refusals are surfaced, never silently swallowed.** Alert content — malware
-  names, attacker command lines — is exactly what Claude's safety classifiers
+  names, attacker command lines — is exactly what the configured model's safety classifiers
   may decline. Both triage phases check for `stop_reason == "refusal"` and mark
   the result `refused` for human review. The investigation phase also enables
   server-side fallbacks, which re-runs a declined request on a fallback model
