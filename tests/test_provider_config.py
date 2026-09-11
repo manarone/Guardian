@@ -29,3 +29,28 @@ def test_unconfigured_analyst_fails_an_alert_without_network_call():
     )
     assert result.status == "failed"
     assert "GUARDIAN_PROVIDER" in (result.error or "")
+
+
+def test_keyed_model_endpoint_must_use_https():
+    import pytest
+
+    settings = Settings(
+        _env_file=None,
+        provider="openai",
+        base_url="http://localhost:8000/v1",
+        model="local-model",
+        api_key="key",
+    )
+    with pytest.raises(ValueError, match="HTTPS"):
+        Analyst(settings, InMemoryStore())
+
+
+def test_keyless_local_model_endpoint_is_allowed():
+    settings = Settings(
+        _env_file=None,
+        provider="openai",
+        base_url="http://localhost:8000/v1",
+        model="local-model",
+    )
+    analyst = Analyst(settings, InMemoryStore())
+    assert analyst.client is not None

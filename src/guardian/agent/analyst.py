@@ -44,6 +44,8 @@ class Analyst:
                 "GUARDIAN_BASE_URL, and GUARDIAN_MODEL before triage."
             )
             return
+        if settings.model_api_key and not settings.base_url.lower().startswith("https://"):
+            raise ValueError("A model API key requires an HTTPS GUARDIAN_BASE_URL")
         if settings.provider == "anthropic":
             kwargs: dict[str, Any] = {}
             if settings.model_api_key:
@@ -52,9 +54,13 @@ class Analyst:
                 kwargs["base_url"] = settings.base_url
             self.client = AsyncAnthropic(**kwargs)
         else:
-            kwargs = {"base_url": settings.base_url}
-            if settings.model_api_key:
-                kwargs["api_key"] = settings.model_api_key
+            # The OpenAI SDK requires a key even for local servers. A dummy
+            # value keeps keyless localhost development possible; hosted
+            # endpoints still require a real key in normal operation.
+            kwargs = {
+                "base_url": settings.base_url,
+                "api_key": settings.model_api_key or "not-needed",
+            }
             self.client = AsyncOpenAI(**kwargs)
 
     async def triage(self, alert: Alert) -> TriageResult:
@@ -163,7 +169,7 @@ class Analyst:
     async def _investigate_openai(self, system: list[dict], opening: dict, tools: list) -> str:
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, opening]
         tool_map = {t.name: t for t in tools}
-        for _ in range(self.settings.max_tool_iterations):
+        for round_number in range(self.settings.max_tool_iterations + 1):
             try:
                 response = await self.client.chat.completions.create(
                     model=self.settings.model,
@@ -175,7 +181,12 @@ class Analyst:
                 # Some compatible gateways expose chat completions but not
                 # function calling. Retry once without tools so the core
                 # triage path still works; other API errors must surface.
-                if getattr(exc, "status_code", None) not in (400, 404, 422):
+                details = str(exc).lower()
+                tool_error = any(
+                    term in details
+                    for term in ("tool", "function calling", "unsupported parameter")
+                )
+                if getattr(exc, "status_code", None) not in (400, 404, 422) or not tool_error:
                     raise
                 response = await self.client.chat.completions.create(
                     model=self.settings.model,
@@ -191,6 +202,10 @@ class Analyst:
                 if not text:
                     raise RuntimeError("Investigation returned no text")
                 return text
+            if round_number == self.settings.max_tool_iterations:
+                raise RuntimeError(
+                    f"Investigation exceeded {self.settings.max_tool_iterations} tool iterations"
+                )
             for call in message.tool_calls:
                 tool = tool_map.get(call.function.name)
                 if tool is None:
@@ -203,9 +218,7 @@ class Analyst:
                     ) from exc
                 output = await tool.call(arguments)
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": str(output)})
-        raise RuntimeError(
-            f"Investigation exceeded {self.settings.max_tool_iterations} tool iterations"
-        )
+        raise RuntimeError("Investigation did not produce a completion")
 
     async def _render_openai(
         self, system: list[dict], opening: dict, investigation: str
@@ -231,9 +244,17 @@ class Analyst:
                 max_tokens=self.settings.max_tokens,
                 response_format=schema,
             )
-        except APIError:
+        except APIError as exc:
             # A number of OpenAI-compatible gateways support JSON mode but not
-            # the newer json_schema response format.
+            # the newer json_schema response format. Do not mask auth, quota,
+            # connectivity, or server failures with a second request.
+            details = str(exc).lower()
+            format_error = any(
+                term in details
+                for term in ("response_format", "json_schema", "structured output", "json schema")
+            )
+            if getattr(exc, "status_code", None) not in (400, 404, 422) or not format_error:
+                raise
             response = await self.client.chat.completions.create(
                 model=self.settings.model,
                 messages=messages,
