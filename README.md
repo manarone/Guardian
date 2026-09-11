@@ -122,7 +122,7 @@ See `.env.example`. Set `GUARDIAN_API_KEY` for OpenAI-compatible providers. Nati
 ## Development
 
 ```bash
-pytest              # 81 tests, no API calls — the analyst is stubbed
+pytest              # 83 tests, no API calls — the analyst is stubbed
 ruff check src tests
 ruff format src tests
 ```
